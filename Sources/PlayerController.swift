@@ -300,6 +300,8 @@ final class PlayerController: ObservableObject {
         pollInterval = 0.3
     }
 
+    func refreshNativeQueue() { queueRevision += 1 }
+
     func enqueueNativePlaylist(_ id: String) async {
         guard addingPlaylistID == nil else { return }
         addingPlaylistID = id

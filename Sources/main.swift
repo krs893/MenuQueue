@@ -142,6 +142,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                                          screen: screen.frame, visible: screen.visibleFrame)
         menuPanel.setFrame(frame, display: false)
         menuPanel.makeKeyAndOrderFront(nil)
+        player.refreshNativeQueue()
         localMonitor = NSEvent.addLocalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown, .keyDown]) {
             [weak self] event in
             guard let self else { return event }

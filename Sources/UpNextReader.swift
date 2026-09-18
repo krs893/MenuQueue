@@ -102,11 +102,11 @@ enum UpNextReader {
         }
         var result: [String] = []
         for t in found {
-            let v = (attr(t, kAXValueAttribute) as? String)
-                ?? (attr(t, kAXValueAttribute) as? NSAttributedString)?.string
-                ?? [str(t, kAXTitleAttribute), str(t, kAXDescriptionAttribute)].first(where: { !$0.isEmpty }) ?? ""
-            let trimmed = v.trimmingCharacters(in: .whitespacesAndNewlines)
-            if !trimmed.isEmpty { result.append(trimmed) }
+            if let value = QueueTextParser.firstText([
+                attr(t, kAXValueAttribute) as? String,
+                (attr(t, kAXValueAttribute) as? NSAttributedString)?.string,
+                str(t, kAXTitleAttribute), str(t, kAXDescriptionAttribute)
+            ]) { result.append(value) }
         }
         return result
     }
@@ -190,26 +190,13 @@ enum UpNextReader {
         if rows.isEmpty {
             rows = children(target).filter { [kAXGroupRole, kAXCellRole].contains(role($0)) }
         }
-        var result: [UpNextRow] = []
-        var inHistory = false
-        for row in rows.prefix(500) {
-            let parts = texts(of: row)
-            guard !parts.isEmpty else { continue }
-            let title = parts[0].replacingOccurrences(of: "\u{FFFC}", with: "").trimmingCharacters(in: .whitespacesAndNewlines)
-            if title == "履歴" || title.lowercased() == "history" { inHistory = true; continue }
-            let hasTrackMenu = find(in: row, limit: 5) {
+        let parsed = rows.prefix(2000).map { row in
+            QueueTextParser.Row(texts: texts(of: row), hasTrackMenu: find(in: row, limit: 5) {
                 str($0, kAXIdentifierAttribute) == "actionButton"
-            } != nil
-            if !hasTrackMenu && (matchesUpNext(title.lowercased()) || title.localizedCaseInsensitiveContains("autoplay") || title.contains("自動再生")) {
-                inHistory = false
-                continue
-            }
-            if inHistory { continue }
-            let subtitle = parts.dropFirst().prefix(2).joined(separator: " — ")
-            result.append(UpNextRow(title: title, subtitle: subtitle))
+            } != nil)
         }
+        return QueueTextParser.upcoming(parsed).map { UpNextRow(title: $0.title, subtitle: $0.subtitle) }
 
-        return result
     }
 }
 

@@ -3,6 +3,22 @@ import Foundation
 @main
 struct RegressionTests {
     @MainActor static func main() async throws {
+        assert(QueueTextParser.firstText(["", "  ", "Song description"]) == "Song description")
+        assert(QueueTextParser.firstText(["\u{FFFC} AutoPlay"]) == "AutoPlay")
+        for heading in ["再生を続ける", "Continue Playing", "次に再生", "Playing Next", "\u{FFFC} AutoPlay", "Playlist name"] {
+            let rows: [QueueTextParser.Row] = [
+                .init(texts: ["履歴"], hasTrackMenu: false),
+                .init(texts: ["Past song"], hasTrackMenu: true),
+                .init(texts: [heading], hasTrackMenu: false),
+                .init(texts: ["Upcoming song", "Artist"], hasTrackMenu: true),
+                .init(texts: ["History"], hasTrackMenu: true)
+            ]
+            let parsed = QueueTextParser.upcoming(rows)
+            assert(parsed.map { $0.title } == ["Upcoming song", "History"], heading)
+            assert(parsed.first?.subtitle == "Artist")
+        }
+        assert(QueueTextParser.upcoming([.init(texts: ["History"], hasTrackMenu: false), .init(texts: ["Old song"], hasTrackMenu: true)]).isEmpty)
+        print("PASS: native queue section boundaries, history exclusion, and empty AX value fallback")
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: directory) }
         let url = directory.appendingPathComponent("queue.json")

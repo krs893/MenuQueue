@@ -87,6 +87,10 @@ final class UpNextModel: ObservableObject {
     @Published var loading = false
     @Published var lastRead: Date?
 
+    // Warm an already visible Music queue without changing Music's UI.
+    // Opening MenuQueue explicitly requests a fresh read as well.
+    init() { refresh() }
+
     func refresh(openIfNeeded: Bool = false) {
         guard !loading else { return }
         loading = true
@@ -102,9 +106,13 @@ final class UpNextModel: ObservableObject {
             case .success(let rows):
                 self.rows = rows
                 self.lastRead = Date()
+                UserDefaults.standard.set("success: \(rows.count) rows", forKey: "queueReadStatus")
+                UserDefaults.standard.set(Date(), forKey: "queueReadDate")
             case .failure(let err):
                 self.rows = []
                 self.error = (err as? LocalizedError)?.errorDescription ?? "\(err)"
+                UserDefaults.standard.set(self.error, forKey: "queueReadStatus")
+                UserDefaults.standard.set(Date(), forKey: "queueReadDate")
             }
         }
     }
