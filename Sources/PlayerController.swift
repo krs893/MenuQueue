@@ -22,6 +22,10 @@ final class PlayerController: ObservableObject {
     @Published var owns = false
     @Published var lastError: String?
     @Published private(set) var pendingSkipCount = 0
+    @Published private(set) var addingPlaylistID: String?
+    @Published private(set) var lastAddedPlaylistID: String?
+    @Published private(set) var lastInsertionPosition: QueueInsertionPosition?
+    @Published private(set) var queueRevision = 0
     private var skipTask: Task<Void, Never>?
     @Published private var requestedShuffle: Bool?
     private var shuffleTask: Task<Void, Never>?
@@ -294,6 +298,20 @@ final class PlayerController: ObservableObject {
         lastError = nil
         _ = await bridge { try MusicBridge.playPlaylist(id) }
         pollInterval = 0.3
+    }
+
+    func enqueueNativePlaylist(_ id: String) async {
+        guard addingPlaylistID == nil else { return }
+        addingPlaylistID = id
+        lastAddedPlaylistID = nil
+        lastInsertionPosition = nil
+        lastError = nil
+        defer { addingPlaylistID = nil }
+        if let position = await bridge({ try MusicBridge.enqueuePlaylist(id) }) {
+            lastAddedPlaylistID = id
+            lastInsertionPosition = position
+            queueRevision += 1
+        }
     }
 
     // MARK: - Transport exposed to the UI

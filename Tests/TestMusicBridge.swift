@@ -33,7 +33,14 @@ enum MusicBridge {
     static var failShuffle = false
     static let shuffleStarted = TestSignal()
     static let readStarted = TestSignal()
-    enum TestError: Error { case shuffleFailed }
+    enum TestError: Error { case shuffleFailed, queueAddFailed }
+    static var enqueuedPlaylists: [String] = []
+    static var failQueueAdd = false
+    static func enqueuePlaylist(_ id: String) throws -> QueueInsertionPosition {
+        if failQueueAdd { throw TestError.queueAddFailed }
+        enqueuedPlaylists.append(id)
+        return .end
+    }
     static func nowPlaying() throws -> NowPlaying {
         let captured = snapshot
         let wait = readDelay

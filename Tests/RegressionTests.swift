@@ -189,6 +189,24 @@ struct RegressionTests {
         assert(player.lastError == nil)
         print("PASS: shuffle failure rolls back; the next click retries")
 
+        let trackBeforeAdd = MusicBridge.snapshot.track
+        let playsBeforeAdd = MusicBridge.plays.count
+        let revisionBeforeAdd = player.queueRevision
+        await player.enqueueNativePlaylist("whole-playlist")
+        assert(MusicBridge.enqueuedPlaylists == ["whole-playlist"])
+        assert(MusicBridge.snapshot.track == trackBeforeAdd && MusicBridge.plays.count == playsBeforeAdd)
+        assert(player.lastAddedPlaylistID == "whole-playlist" && player.addingPlaylistID == nil)
+        assert(player.queueRevision == revisionBeforeAdd + 1)
+        MusicBridge.failQueueAdd = true
+        await player.enqueueNativePlaylist("unavailable-playlist")
+        assert(player.lastAddedPlaylistID == nil && player.lastError != nil && player.addingPlaylistID == nil)
+        MusicBridge.failQueueAdd = false
+        assert(QueueInsertionPosition.menuChoice(["再生", "次に再生", "キューに追加"])?.position == .end)
+        assert(QueueInsertionPosition.menuChoice(["再生", "次に再生"])?.position == .next)
+        assert(QueueInsertionPosition.menuChoice(["Play", "Play Last"])?.position == .end)
+        assert(QueueInsertionPosition.menuChoice(["Play", "プレイリストに追加", "ライブラリから削除"]) == nil)
+        print("PASS: whole playlist enqueue preserves playback and excludes replacement/deletion actions")
+
         let displays: [CGRect] = [
             CGRect(x: 0, y: 0, width: 1440, height: 900),
             CGRect(x: -1920, y: 0, width: 1920, height: 1080),

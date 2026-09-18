@@ -10,13 +10,11 @@ func timeString(_ seconds: Double) -> String {
 
 enum Tab: String, CaseIterable, Identifiable {
     case queue = "キュー"
-    case search = "検索"
     case playlists = "プレイリスト"
     var id: String { rawValue }
     var icon: String {
         switch self {
         case .queue: return "list.bullet"
-        case .search: return "magnifyingglass"
         case .playlists: return "music.note.list"
         }
     }
@@ -52,9 +50,8 @@ struct ContentView: View {
                 Group {
                     switch tab {
                     case .queue: UpNextTab(model: upNext)
-                        .task(id: player.now.track?.databaseID) { upNext.refresh(openIfNeeded: true) }
-                    case .search: LibraryTab(library: library, player: player, mode: .search)
-                    case .playlists: LibraryTab(library: library, player: player, mode: .playlists)
+                        .task(id: "\(player.now.track?.databaseID ?? 0):\(player.queueRevision)") { upNext.refresh(openIfNeeded: true) }
+                    case .playlists: LibraryTab(library: library, player: player)
 
                     }
                 }
@@ -265,74 +262,59 @@ struct UpNextTab: View {
 struct LibraryTab: View {
     @ObservedObject var library: LibraryModel
     @ObservedObject var player: PlayerController
-    let mode: Tab
+    private let controlSize: CGFloat = 34
 
     var body: some View {
         VStack(spacing: 0) {
-            if mode == .search {
-                if let error = library.searchError {
-                    Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange).help(error).padding(10)
-                }
-                searchSection
-            } else {
-                HStack {
-                    if library.isLoadingPlaylists { ProgressView().controlSize(.small) }
-                    Spacer()
+            HStack(spacing: 8) {
+                if let selected = library.selectedPlaylist {
+                    Button { library.selectedPlaylist = nil } label: {
+                        Image(systemName: "chevron.left").frame(width: controlSize, height: controlSize)
+                    }.help("戻る")
+                    Text(selected.name).font(.subheadline).bold().lineLimit(1)
+                        .frame(maxWidth: .infinity, alignment: .leading).layoutPriority(-1)
                     Button {
-                        if let playlist = library.selectedPlaylist { library.loadTracks(of: playlist) }
-                        else { library.loadPlaylists() }
-                    } label: { Image(systemName: "arrow.clockwise") }
-                    .buttonStyle(.borderless).help("再読み込み")
-                }.padding(.horizontal, 10)
-                if let error = library.playlistError {
-                    Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange).help(error).padding(10)
+                        Task { await player.enqueueNativePlaylist(selected.id) }
+                    } label: {
+                        Group {
+                            if player.addingPlaylistID == selected.id { ProgressView().controlSize(.small) }
+                            else { Image(systemName: player.lastAddedPlaylistID == selected.id ? "checkmark" : "text.badge.plus") }
+                        }.frame(width: controlSize, height: controlSize)
+                    }
+                    .help(player.lastAddedPlaylistID == selected.id ? "全曲を追加しました" : "全曲をキューに追加")
+                    .accessibilityLabel("全曲をキューに追加")
+                    .disabled(library.playlistTracks.isEmpty || player.addingPlaylistID != nil)
+                    Button {
+                        Task { await player.playNativePlaylist(selected.id) }
+                    } label: { Image(systemName: "play.fill").frame(width: controlSize, height: controlSize) }
+                    .help("プレイリストを再生").accessibilityLabel("プレイリストを再生")
+                    .disabled(library.playlistTracks.isEmpty || player.addingPlaylistID != nil)
+                } else { Spacer() }
+                Button {
+                    if let selected = library.selectedPlaylist { library.loadTracks(of: selected) }
+                    else { library.loadPlaylists() }
+                } label: {
+                    Group {
+                        if library.isLoadingPlaylists || library.isLoadingTracks { ProgressView().controlSize(.small) }
+                        else { Image(systemName: "arrow.clockwise") }
+                    }.frame(width: controlSize, height: controlSize)
                 }
-                playlistSection
+                .help("再読み込み").accessibilityLabel("再読み込み")
+                .disabled(library.isLoadingPlaylists || library.isLoadingTracks || player.addingPlaylistID != nil)
             }
-
-        }
-    }
-
-    @ViewBuilder private var searchSection: some View {
-        HStack(spacing: 6) {
-            Image(systemName: "magnifyingglass").foregroundStyle(.secondary).font(.system(size: 11))
-            TextField("", text: $library.query)
-                .textFieldStyle(.plain)
-                .onChange(of: library.query) { _, _ in library.searchDebounced() }
-            if library.isSearching { ProgressView().controlSize(.small) }
-        }
-        .padding(6)
-        .background(RoundedRectangle(cornerRadius: 6).fill(.quaternary.opacity(0.5)))
-        .padding(.horizontal, 10)
-
-        if library.results.isEmpty {
-            EmptyHint(icon: "magnifyingglass", text: library.isSearching ? "検索中…" : library.query.isEmpty ? "ライブラリから聴きたい曲を探す" : "一致する曲がありません")
-        } else {
-            List(library.results) { track in
-                TrackPickRow(track: track, play: { Task { await player.playNative(track) } })
+            .buttonStyle(.borderless)
+            .fixedSize(horizontal: false, vertical: true)
+            .padding(.horizontal, 10).padding(.vertical, 6)
+            Divider()
+            if let error = library.playlistError {
+                Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange).help(error).padding(10)
             }
-            .listStyle(.plain)
+            playlistSection
         }
     }
 
     @ViewBuilder private var playlistSection: some View {
-        if let selected = library.selectedPlaylist {
-            HStack(spacing: 6) {
-                Button { library.selectedPlaylist = nil } label: {
-                    Image(systemName: "chevron.left")
-                }.buttonStyle(.borderless)
-                Text(selected.name).font(.subheadline).bold().lineLimit(1)
-                Text("\(library.playlistTracks.count)").font(.caption).foregroundStyle(.secondary)
-                Spacer()
-                Button {
-                    Task { await player.playNativePlaylist(selected.id) }
-                } label: { Image(systemName: "play.fill") }
-                .help("このプレイリストをMusicで再生")
-                .controlSize(.small)
-                .disabled(library.playlistTracks.isEmpty)
-            }
-            .padding(.horizontal, 10).padding(.bottom, 4)
-
+        if library.selectedPlaylist != nil {
             if library.playlistTracks.isEmpty {
                 EmptyHint(icon: library.isLoadingTracks ? "hourglass" : "music.note.list",
                           text: library.isLoadingTracks ? "読み込み中…" : "このプレイリストは空です")
@@ -365,21 +347,22 @@ struct TrackPickRow: View {
     let play: () -> Void
 
     var body: some View {
-        HStack(spacing: 6) {
-            VStack(alignment: .leading, spacing: 1) {
-                Text(track.name).font(.system(size: 13)).lineLimit(1)
-                Text(track.subtitle).font(.system(size: 11)).foregroundStyle(.secondary).lineLimit(1)
+        Button(action: play) {
+            HStack(spacing: 10) {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(track.name).font(.system(size: 14)).lineLimit(1)
+                    Text(track.subtitle).font(.system(size: 12)).foregroundStyle(.secondary).lineLimit(1)
+                }
+                Spacer(minLength: 4)
+                Image(systemName: "play.fill").foregroundStyle(.secondary).frame(width: 32, height: 32)
             }
-            Spacer(minLength: 4)
-            Button(action: play) {
-                Image(systemName: "play.fill").frame(width: 32, height: 32)
-            }.help("再生").accessibilityLabel("再生")
+            .frame(maxWidth: .infinity, minHeight: 48, alignment: .leading)
+            .contentShape(Rectangle())
         }
-        .buttonStyle(.borderless)
-        .font(.system(size: 12))
-        .contentShape(Rectangle())
-        .onTapGesture(count: 2, perform: play)
+        .buttonStyle(.plain)
+        .help("再生").accessibilityLabel("\(track.name)を再生")
     }
+
 }
 
 // MARK: - Bits

@@ -13,6 +13,10 @@ struct UpNextRow: Identifiable, Hashable {
 /// popover is open, and Apple can rename or restructure it in any update.
 /// Everything here degrades to a readable error instead of crashing.
 enum UpNextReader {
+    // Reading the queue and adding a playlist both touch Music's UI. Do not
+    // allow an automatic refresh to close a menu while an addition is pending.
+    private static let accessQueue = DispatchQueue(label: "jp.menuqueue.music-ui")
+
 
     enum ReadError: LocalizedError {
         case notTrusted
@@ -76,7 +80,7 @@ enum UpNextReader {
                              _ test: (AXUIElement) -> Bool) -> AXUIElement? {
         if depth > limit { return nil }
         if test(el) { return el }
-        for child in children(el) {
+        for child in children(el).reversed() {
             if let hit = find(in: child, depth: depth + 1, limit: limit, test) { return hit }
         }
         return nil
@@ -93,10 +97,14 @@ enum UpNextReader {
 
     private static func texts(of el: AXUIElement) -> [String] {
         var found: [AXUIElement] = []
-        collect(in: el, limit: 8, into: &found) { role($0) == kAXStaticTextRole }
+        collect(in: el, limit: 8, into: &found) {
+            [kAXStaticTextRole, kAXTextAreaRole, "AXText"].contains(role($0))
+        }
         var result: [String] = []
         for t in found {
-            let v = (attr(t, kAXValueAttribute) as? String) ?? str(t, kAXTitleAttribute)
+            let v = (attr(t, kAXValueAttribute) as? String)
+                ?? (attr(t, kAXValueAttribute) as? NSAttributedString)?.string
+                ?? [str(t, kAXTitleAttribute), str(t, kAXDescriptionAttribute)].first(where: { !$0.isEmpty }) ?? ""
             let trimmed = v.trimmingCharacters(in: .whitespacesAndNewlines)
             if !trimmed.isEmpty { result.append(trimmed) }
         }
@@ -108,6 +116,10 @@ enum UpNextReader {
     /// Opens Music.app's Up Next popover, scrapes it, and closes it again.
     /// Must be called off the main thread.
     static func read(openIfNeeded: Bool = false) throws -> [UpNextRow] {
+        try accessQueue.sync { try readImpl(openIfNeeded: openIfNeeded) }
+    }
+
+    private static func readImpl(openIfNeeded: Bool) throws -> [UpNextRow] {
         guard isTrusted else { throw ReadError.notTrusted }
         guard let app = NSRunningApplication
             .runningApplications(withBundleIdentifier: MusicBridge.bundleID).first
@@ -123,20 +135,34 @@ enum UpNextReader {
 
         func lists() -> [AXUIElement] {
             var result: [AXUIElement] = []
-            collect(in: axApp, limit: 24, into: &result) {
-                [kAXTableRole, kAXOutlineRole, kAXListRole].contains(role($0))
+            func visit(_ element: AXUIElement, depth: Int) {
+                guard depth < 18 else { return }
+                let r = role(element)
+                if [kAXTableRole, kAXOutlineRole, kAXListRole].contains(r) {
+                    result.append(element)
+                    return
+                }
+                if r == "AXCollection" { return }
+                for child in children(element) { visit(child, depth: depth + 1) }
             }
+            visit(axApp, depth: 0)
             return result
         }
         func labelledList() -> AXUIElement? {
-            find(in: axApp, limit: 24) { el in
-                guard matchesUpNext(labelBlob(el)) else { return false }
-                return [kAXTableRole, kAXOutlineRole, kAXListRole].contains(role(el))
-            }
+            if let labelled = find(in: axApp, limit: 24, { el in
+                matchesUpNext(labelBlob(el)) &&
+                [kAXTableRole, kAXOutlineRole, kAXListRole].contains(role(el))
+            }) { return labelled }
+            // Current Music labels the surrounding container "再生キュー";
+            // its table itself has no label.
+            guard let region = find(in: axApp, limit: 24, { el in
+                str(el, kAXIdentifierAttribute) == "headerContainer" && matchesUpNext(labelBlob(el))
+            }) else { return nil }
+            return find(in: region, limit: 6) { [kAXTableRole, kAXListRole].contains(role($0)) }
         }
 
-        let before = lists()
         var target = labelledList()
+        let before = target == nil ? lists() : []
         var opened = false
         defer {
             if opened { AXUIElementPerformAction(button, kAXPressAction as CFString) }
@@ -165,14 +191,81 @@ enum UpNextReader {
             rows = children(target).filter { [kAXGroupRole, kAXCellRole].contains(role($0)) }
         }
         var result: [UpNextRow] = []
-        for row in rows.prefix(200) {
+        var inHistory = false
+        for row in rows.prefix(500) {
             let parts = texts(of: row)
             guard !parts.isEmpty else { continue }
-            let title = parts[0]
+            let title = parts[0].replacingOccurrences(of: "\u{FFFC}", with: "").trimmingCharacters(in: .whitespacesAndNewlines)
+            if title == "履歴" || title.lowercased() == "history" { inHistory = true; continue }
+            let hasTrackMenu = find(in: row, limit: 5) {
+                str($0, kAXIdentifierAttribute) == "actionButton"
+            } != nil
+            if !hasTrackMenu && (matchesUpNext(title.lowercased()) || title.localizedCaseInsensitiveContains("autoplay") || title.contains("自動再生")) {
+                inHistory = false
+                continue
+            }
+            if inHistory { continue }
             let subtitle = parts.dropFirst().prefix(2).joined(separator: " — ")
             result.append(UpNextRow(title: title, subtitle: subtitle))
         }
 
         return result
+    }
+}
+
+
+extension UpNextReader {
+    enum AddError: LocalizedError {
+        case playlistNotShown, menuUnavailable, queueActionUnavailable, actionFailed
+        var errorDescription: String? {
+            switch self {
+            case .playlistNotShown: return "追加するプレイリストをMusicで確認できませんでした"
+            case .menuUnavailable: return "Musicのプレイリスト操作メニューを開けませんでした"
+            case .queueActionUnavailable: return "Musicでキューへの追加を利用できません。曲を再生してから試してください"
+            case .actionFailed: return "キューへの追加操作に失敗しました"
+            }
+        }
+    }
+
+    static func enqueuePlaylist(_ persistentID: String) throws -> QueueInsertionPosition {
+        try accessQueue.sync {
+            guard isTrusted else { throw ReadError.notTrusted }
+            guard let app = NSRunningApplication.runningApplications(withBundleIdentifier: MusicBridge.bundleID).first
+            else { throw ReadError.notRunning }
+            let axApp = AXUIElementCreateApplication(app.processIdentifier)
+            // Identify the playlist by its persistent ID, never an ambiguous name.
+            try MusicBridge.revealPlaylist(persistentID)
+            var more: AXUIElement?
+            for _ in 0..<20 {
+                if (try? MusicBridge.displayedPlaylistID()) == persistentID {
+                    if let toolbar = find(in: axApp, limit: 8, { role($0) == kAXToolbarRole }) {
+                        more = find(in: toolbar, limit: 5) { str($0, kAXIdentifierAttribute) == "moreBtn" }
+                    }
+                    if more != nil { break }
+                }
+                Thread.sleep(forTimeInterval: 0.1)
+            }
+            guard (try? MusicBridge.displayedPlaylistID()) == persistentID else { throw AddError.playlistNotShown }
+            guard let more, AXUIElementPerformAction(more, kAXPressAction as CFString) == .success
+            else { throw AddError.menuUnavailable }
+
+            var menu: AXUIElement?
+            for _ in 0..<15 {
+                menu = find(in: axApp, limit: 8) { role($0) == kAXMenuRole }
+                if menu != nil { break }
+                Thread.sleep(forTimeInterval: 0.05)
+            }
+            guard let menu else { throw AddError.menuUnavailable }
+            defer { AXUIElementPerformAction(menu, kAXCancelAction as CFString) }
+            guard (try? MusicBridge.displayedPlaylistID()) == persistentID else { throw AddError.playlistNotShown }
+            let options = children(menu).filter {
+                role($0) == kAXMenuItemRole && (attr($0, kAXEnabledAttribute) as? Bool) != false
+            }
+            let titles = options.map { str($0, kAXTitleAttribute) }
+            guard let choice = QueueInsertionPosition.menuChoice(titles) else { throw AddError.queueActionUnavailable }
+            guard AXUIElementPerformAction(options[choice.index], kAXPressAction as CFString) == .success
+            else { throw AddError.actionFailed }
+            return choice.position
+        }
     }
 }

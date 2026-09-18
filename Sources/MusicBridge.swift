@@ -218,6 +218,27 @@ enum MusicBridge {
         try ScriptRunner.shared.run(src)
     }
 
+    static func enqueuePlaylist(_ id: String) throws -> QueueInsertionPosition {
+        try UpNextReader.enqueuePlaylist(id)
+    }
+
+    static func revealPlaylist(_ persistentID: String) throws {
+        let pid = esc(persistentID)
+        try ScriptRunner.shared.run("""
+        tell application id "com.apple.Music"
+            reveal (first user playlist whose persistent ID is "\(pid)")
+        end tell
+        """)
+    }
+
+    static func displayedPlaylistID() throws -> String {
+        try ScriptRunner.shared.string("""
+        tell application id "com.apple.Music"
+            return persistent ID of view of front browser window
+        end tell
+        """)
+    }
+
     // MARK: Library browsing
 
     static func search(_ query: String, limit: Int = 60) throws -> [MusicTrack] {

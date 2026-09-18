@@ -41,3 +41,20 @@ struct NowPlaying {
     var volume: Int = 100
 }
 
+
+/// Music offers Add to Queue when an explicit queue exists, and Play Next
+/// when creating one. Both insert a whole playlist without replacing playback.
+enum QueueInsertionPosition: Equatable {
+    case end, next
+
+    static func menuChoice(_ titles: [String]) -> (index: Int, position: Self)? {
+        let normalized = titles.map { $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }
+        for name in ["キューに追加", "最後に再生", "あとで再生", "add to queue", "play last", "play later"] {
+            if let index = normalized.firstIndex(of: name) { return (index, .end) }
+        }
+        for name in ["次に再生", "play next"] {
+            if let index = normalized.firstIndex(of: name) { return (index, .next) }
+        }
+        return nil
+    }
+}
