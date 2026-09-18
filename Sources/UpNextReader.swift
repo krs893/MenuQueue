@@ -121,36 +121,50 @@ enum UpNextReader {
             return matchesUpNext(labelBlob(el))
         }) else { throw ReadError.buttonNotFound }
 
-        AXUIElementPerformAction(button, kAXPressAction as CFString)
-        Thread.sleep(forTimeInterval: 0.55)
-
-        defer {
-            AXUIElementPerformAction(button, kAXPressAction as CFString)
-        }
-
-        // The popover hosts a table/outline/list of rows.
-        var containers: [AXUIElement] = []
-        collect(in: axApp, limit: 24, into: &containers) { el in
-            let r = role(el)
-            return r == kAXTableRole || r == kAXOutlineRole || r == kAXListRole
-        }
-
-        // Pick the densest list that is not the main library table.
-        let candidates = containers.compactMap { container -> (AXUIElement, [AXUIElement])? in
-            var rows: [AXUIElement] = []
-            collect(in: container, limit: 6, into: &rows) { role($0) == kAXRowRole }
-            if rows.isEmpty {
-                collect(in: container, limit: 4, into: &rows) { role($0) == kAXGroupRole || role($0) == kAXCellRole }
+        func lists() -> [AXUIElement] {
+            var result: [AXUIElement] = []
+            collect(in: axApp, limit: 24, into: &result) {
+                [kAXTableRole, kAXOutlineRole, kAXListRole].contains(role($0))
             }
-            return rows.isEmpty ? nil : (container, rows)
+            return result
+        }
+        func labelledList() -> AXUIElement? {
+            find(in: axApp, limit: 24) { el in
+                guard matchesUpNext(labelBlob(el)) else { return false }
+                return [kAXTableRole, kAXOutlineRole, kAXListRole].contains(role(el))
+            }
         }
 
-        guard let best = candidates.min(by: { $0.1.count < $1.1.count }) ?? candidates.first else {
-            throw ReadError.listNotFound
+        let before = lists()
+        var target = labelledList()
+        var opened = false
+        defer {
+            if opened { AXUIElementPerformAction(button, kAXPressAction as CFString) }
         }
-
+        if target == nil {
+            // Do not choose an arbitrary library table: only a labelled queue
+            // or a uniquely identifiable list that appeared after opening it.
+            let alreadyOpen = (attr(button, kAXValueAttribute) as? NSNumber)?.boolValue == true
+            guard !alreadyOpen else { throw ReadError.listNotFound }
+            guard AXUIElementPerformAction(button, kAXPressAction as CFString) == .success else {
+                throw ReadError.buttonNotFound
+            }
+            opened = true
+            Thread.sleep(forTimeInterval: 0.55)
+            target = labelledList()
+            if target == nil {
+                let fresh = lists().filter { candidate in !before.contains { CFEqual($0, candidate) } }
+                if fresh.count == 1 { target = fresh.first }
+            }
+        }
+        guard let target else { throw ReadError.listNotFound }
+        var rows: [AXUIElement] = []
+        collect(in: target, limit: 6, into: &rows) { role($0) == kAXRowRole }
+        if rows.isEmpty {
+            rows = children(target).filter { [kAXGroupRole, kAXCellRole].contains(role($0)) }
+        }
         var result: [UpNextRow] = []
-        for row in best.1.prefix(200) {
+        for row in rows.prefix(200) {
             let parts = texts(of: row)
             guard !parts.isEmpty else { continue }
             let title = parts[0]

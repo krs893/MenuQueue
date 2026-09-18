@@ -1,56 +1,80 @@
 import Foundation
 import Combine
 
-/// Library search + playlist browsing, used by the "追加" tab.
 @MainActor
 final class LibraryModel: ObservableObject {
-
-    @Published var query: String = ""
+    @Published var query = ""
     @Published var results: [MusicTrack] = []
     @Published var playlists: [PlaylistInfo] = []
     @Published var selectedPlaylist: PlaylistInfo?
     @Published var playlistTracks: [MusicTrack] = []
     @Published var isSearching = false
-    @Published var error: String?
-
+    @Published var isLoadingPlaylists = false
+    @Published var isLoadingTracks = false
+    @Published var searchError: String?
+    @Published var playlistError: String?
     private var searchTask: Task<Void, Never>?
+    private var trackRevision = 0
 
     func searchDebounced() {
         searchTask?.cancel()
+        searchError = nil
         let q = query.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !q.isEmpty else { results = []; isSearching = false; return }
         isSearching = true
         searchTask = Task { [weak self] in
             try? await Task.sleep(nanoseconds: 300_000_000)
             guard !Task.isCancelled, let self else { return }
-            let found = await Task.detached(priority: .userInitiated) {
-                (try? MusicBridge.search(q)) ?? []
+            let outcome = await Task.detached(priority: .userInitiated) {
+                Result { try MusicBridge.search(q) }
             }.value
             guard !Task.isCancelled else { return }
-            self.results = found
             self.isSearching = false
+            switch outcome {
+            case .success(let tracks): self.results = tracks
+            case .failure(let error):
+                self.results = []
+                self.searchError = error.localizedDescription
+            }
         }
     }
 
     func loadPlaylists() {
+        guard !isLoadingPlaylists else { return }
+        isLoadingPlaylists = true
+        playlistError = nil
         Task { [weak self] in
-            let lists = await Task.detached(priority: .userInitiated) {
-                (try? MusicBridge.playlists()) ?? []
+            let outcome = await Task.detached(priority: .userInitiated) {
+                Result { try MusicBridge.playlists() }
             }.value
-            self?.playlists = lists.sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
+            guard let self else { return }
+            self.isLoadingPlaylists = false
+            switch outcome {
+            case .success(let lists):
+                self.playlists = lists.sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
+            case .failure(let error): self.playlistError = error.localizedDescription
+            }
         }
     }
 
     func loadTracks(of playlist: PlaylistInfo) {
         selectedPlaylist = playlist
         playlistTracks = []
+        playlistError = nil
+        isLoadingTracks = true
+        trackRevision += 1
+        let revision = trackRevision
         Task { [weak self] in
-            let pid = playlist.id
-            let tracks = await Task.detached(priority: .userInitiated) {
-                (try? MusicBridge.tracks(inPlaylist: pid)) ?? []
+            let outcome = await Task.detached(priority: .userInitiated) {
+                Result { try MusicBridge.tracks(inPlaylist: playlist.id) }
             }.value
-            guard self?.selectedPlaylist?.id == pid else { return }
-            self?.playlistTracks = tracks
+            guard let self, self.selectedPlaylist?.id == playlist.id,
+                  self.trackRevision == revision else { return }
+            self.isLoadingTracks = false
+            switch outcome {
+            case .success(let tracks): self.playlistTracks = tracks
+            case .failure(let error): self.playlistError = error.localizedDescription
+            }
         }
     }
 }

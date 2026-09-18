@@ -21,11 +21,17 @@ final class PlayerController: ObservableObject {
     @Published var musicRunning = false
     @Published var owns = false
     @Published var lastError: String?
+    @Published private(set) var pendingSkipCount = 0
+    private var skipTask: Task<Void, Never>?
 
     @Published var gaplessTakeover: Bool = UserDefaults.standard.object(forKey: "gaplessTakeover") as? Bool ?? true {
         didSet {
             UserDefaults.standard.set(gaplessTakeover, forKey: "gaplessTakeover")
-            if !gaplessTakeover { restoreRepeat() }
+            Task {
+                guard !transitioning else { return }
+                if gaplessTakeover && owns { await applyRepeatOne() }
+                else { await restoreRepeat() }
+            }
         }
     }
 
@@ -35,13 +41,21 @@ final class PlayerController: ObservableObject {
     private var savedRepeat: String?
     private var lastPosition: Double = 0
     private var advancing = false
+    private var transitioning = false
+    private var polling = false
+    private var revision = 0
+    private var expectedUntil: Date?
+    private var observer: NSObjectProtocol?
+
+    var displayedRepeat: String { owns ? (savedRepeat ?? now.repeatMode) : now.repeatMode }
     private var loopTask: Task<Void, Never>?
     private var artworkDBID: Int?
     private var pollInterval: Double = 1.0
 
-    init(store: QueueStore) {
+    init(store: QueueStore, startPolling: Bool = true) {
         self.store = store
-        DistributedNotificationCenter.default().addObserver(
+        guard startPolling else { return }
+        observer = DistributedNotificationCenter.default().addObserver(
             forName: Notification.Name("com.apple.Music.playerInfo"),
             object: nil, queue: .main
         ) { [weak self] _ in
@@ -64,7 +78,12 @@ final class PlayerController: ObservableObject {
 
     func shutdown() {
         loopTask?.cancel()
-        restoreRepeat()
+        skipTask?.cancel()
+        if let observer { DistributedNotificationCenter.default().removeObserver(observer) }
+        // Termination must not leave an unawaited task restoring repeat after exit.
+        if let saved = savedRepeat, MusicBridge.isRunning {
+            try? MusicBridge.setRepeat(saved)
+        }
     }
 
     // MARK: - Polling
@@ -73,12 +92,16 @@ final class PlayerController: ObservableObject {
         do {
             return try await Task.detached(priority: .userInitiated) { try work() }.value
         } catch {
-            await MainActor.run { self.lastError = "\(error)" }
+            await MainActor.run { self.lastError = error.localizedDescription }
             return nil
         }
     }
 
     func tick() async {
+        guard !polling, !transitioning else { return }
+        polling = true
+        defer { polling = false }
+        let snapshotRevision = revision
         let running = MusicBridge.isRunning
         musicRunning = running
         guard running else {
@@ -86,7 +109,9 @@ final class PlayerController: ObservableObject {
             artwork = nil
             artworkDBID = nil
             pollInterval = 3.0
-            if owns { owns = false; savedRepeat = nil }
+            owns = false
+            expectedDBID = nil
+            savedRepeat = nil
             return
         }
 
@@ -95,9 +120,9 @@ final class PlayerController: ObservableObject {
             return
         }
 
+        guard snapshotRevision == revision, !transitioning else { return }
         let previousState = now.state
         now = np
-        lastError = nil
 
         // Artwork only when the track actually changes — it is the expensive call.
         if np.track?.databaseID != artworkDBID {
@@ -106,7 +131,9 @@ final class PlayerController: ObservableObject {
             if np.track?.databaseID == artworkDBID { artwork = img }
         }
 
+        guard snapshotRevision == revision, !transitioning else { return }
         if owns { await evaluateAdvance(np, previousState: previousState) }
+        guard snapshotRevision == revision else { return }
 
         lastPosition = np.position
         pollInterval = computeInterval(np)
@@ -124,55 +151,76 @@ final class PlayerController: ObservableObject {
     private func evaluateAdvance(_ np: NowPlaying, previousState: PlayerState) async {
         // Music jumped to a track we did not ask for: release the queue.
         if let t = np.track, let expected = expectedDBID, t.databaseID != expected {
-            releaseOwnership()
+            if let expectedUntil, Date() < expectedUntil { return }
+            await releaseOwnership()
             return
         }
+        if np.track?.databaseID == expectedDBID { expectedUntil = nil }
         if np.state == .stopped && previousState.isPlaying {
-            await advance()
+            await advance(automatically: true)
             return
         }
         guard let d = np.track?.duration, d > 0, np.state.isPlaying else { return }
         let remaining = d - np.position
-        if remaining <= 0.35 {
-            await advance()
+        if remaining <= 0.15 {
+            await advance(automatically: true)
             return
         }
         // Repeat-one looped us back to the top: the track finished.
         if lastPosition > 2, np.position < lastPosition - 2, (d - lastPosition) < 2.5 {
-            await advance()
+            await advance(automatically: true)
         }
     }
 
     // MARK: - Queue-driven playback
 
     func play(item: QueueItem) async {
-        _ = store.select(item.id)
+        guard !transitioning, !advancing,
+              store.items.contains(where: { $0.id == item.id }) else { return }
         await start(item)
     }
 
     private func start(_ item: QueueItem) async {
-        expectedDBID = item.track.databaseID
+        guard !transitioning else { return }
+        transitioning = true
+        revision += 1
+        defer { transitioning = false }
+        lastError = nil
+        await applyRepeatOne()
+        let dbID = item.track.databaseID
+        let playlistID = item.track.sourcePlaylistID
+        let ok = await bridge({ try MusicBridge.play(databaseID: dbID, playlistID: playlistID) })
+        guard ok == true else {
+            if ok == false { lastError = "ライブラリに見つかりません: \(item.track.name)" }
+            await releaseOwnership()
+            return
+        }
+        _ = store.select(item.id)
+        expectedDBID = dbID
+        expectedUntil = Date().addingTimeInterval(3)
         owns = true
         lastPosition = 0
-        applyRepeatOne()
-        let dbID = item.track.databaseID
-        let ok = await bridge({ try MusicBridge.play(databaseID: dbID) }) ?? false
-        if ok != true {
-            lastError = "ライブラリに見つかりません: \(item.track.name)"
-        }
         pollInterval = 0.3
     }
 
-    func advance() async {
-        guard !advancing else { return }
+    func advance(automatically: Bool = false) async {
+        guard !advancing, !transitioning else { return }
         advancing = true
         defer { advancing = false }
-
+        if automatically, displayedRepeat == "one",
+           let item = store.items.first(where: { $0.id == store.currentID }) {
+            await start(item)
+            return
+        }
+        let repeatAll = displayedRepeat == "all"
         if let next = store.advance() {
             await start(next)
+        } else if repeatAll, let first = store.items.first {
+            await start(first)
         } else {
-            releaseOwnership()
+            revision += 1
             _ = await bridge({ try MusicBridge.pause() })
+            await releaseOwnership()
         }
     }
 
@@ -181,48 +229,84 @@ final class PlayerController: ObservableObject {
         await play(item: first)
     }
 
-    private func releaseOwnership() {
+    func clearQueue() async {
+        guard !transitioning, !advancing else { return }
+        transitioning = true
+        defer { transitioning = false }
+        revision += 1
+        store.clearAll()
+        await releaseOwnership()
+    }
+
+    func replaceQueue(with tracks: [MusicTrack]) async {
+        guard !transitioning, !advancing else { return }
+        store.replaceAll(with: tracks)
+        await startQueueFromTop()
+    }
+
+    private func releaseOwnership() async {
         owns = false
         expectedDBID = nil
-        restoreRepeat()
+        expectedUntil = nil
+        await restoreRepeat()
     }
 
-    private func applyRepeatOne() {
+    private func applyRepeatOne() async {
         guard gaplessTakeover else { return }
-        if savedRepeat == nil { savedRepeat = now.repeatMode.isEmpty ? "off" : now.repeatMode }
-        let mode = "one"
-        Task.detached { try? MusicBridge.setRepeat(mode) }
+        if savedRepeat == nil {
+            guard let current = await bridge({ try MusicBridge.nowPlaying() }) else { return }
+            savedRepeat = current.repeatMode
+        }
+        _ = await bridge({ try MusicBridge.setRepeat("one") })
     }
 
-    private func restoreRepeat() {
+    private func restoreRepeat() async {
         guard let saved = savedRepeat else { return }
-        savedRepeat = nil
-        Task.detached { try? MusicBridge.setRepeat(saved) }
+        let restored: Void? = await bridge({ try MusicBridge.setRepeat(saved) })
+        if restored != nil { savedRepeat = nil }
     }
 
     // MARK: - Transport exposed to the UI
 
     func togglePlayPause() {
-        Task { _ = await bridge({ try MusicBridge.playPause() }); await tick() }
-    }
-
-    func next() {
         Task {
-            if owns || !store.upcoming.isEmpty {
-                if !owns, let first = store.items.first, store.currentID == nil {
-                    await play(item: first)
-                } else {
-                    await advance()
-                }
+            guard !transitioning, !advancing else { return }
+            if !owns && now.state == .stopped && !store.items.isEmpty {
+                await startQueueFromTop()
             } else {
-                _ = await bridge({ try MusicBridge.nativeNext() })
+                _ = await bridge({ try MusicBridge.playPause() })
             }
             await tick()
         }
     }
 
+    func next() {
+        // Preserve rapid clicks while Music is processing a previous command.
+        pendingSkipCount += 1
+        guard skipTask == nil else { return }
+        skipTask = Task {
+            defer { skipTask = nil; pendingSkipCount = 0 }
+            while pendingSkipCount > 0 && !Task.isCancelled {
+                while transitioning || advancing {
+                    try? await Task.sleep(nanoseconds: 30_000_000)
+                    if Task.isCancelled { return }
+                }
+                lastError = nil
+                if owns {
+                    await advance()
+                } else {
+                    revision += 1
+                    _ = await bridge({ try MusicBridge.nativeNext() })
+                }
+                pendingSkipCount -= 1
+                await tick()
+            }
+        }
+    }
+
     func previous() {
         Task {
+            guard !transitioning, !advancing else { return }
             if now.position > 3 {
                 _ = await bridge({ try MusicBridge.seek(to: 0) })
             } else if owns, let prev = store.previous() {
@@ -235,6 +319,8 @@ final class PlayerController: ObservableObject {
     }
 
     func seek(to seconds: Double) {
+        guard seconds.isFinite, !transitioning else { return }
+        revision += 1
         now.position = seconds
         lastPosition = seconds
         Task { _ = await bridge({ try MusicBridge.seek(to: seconds) }) }
@@ -263,10 +349,11 @@ final class PlayerController: ObservableObject {
 
     func cycleRepeat() {
         let order = ["off", "all", "one"]
-        let idx = order.firstIndex(of: now.repeatMode) ?? 0
+        guard !transitioning else { return }
+        let idx = order.firstIndex(of: displayedRepeat) ?? 0
         let target = order[(idx + 1) % order.count]
         now.repeatMode = target
-        if owns { savedRepeat = target } else { Task { _ = await bridge({ try MusicBridge.setRepeat(target) }) } }
+        if owns && gaplessTakeover { savedRepeat = target } else { Task { _ = await bridge({ try MusicBridge.setRepeat(target) }) } }
         if !owns { Task { await tick() } }
     }
 

@@ -1,5 +1,6 @@
 import Foundation
 import Combine
+import SwiftUI
 
 struct QueueItem: Identifiable, Codable, Hashable {
     var id: UUID = UUID()
@@ -14,7 +15,7 @@ final class QueueStore: ObservableObject {
 
     @Published private(set) var items: [QueueItem] = []
     /// The queue entry the controller believes is currently playing.
-    @Published var currentID: UUID?
+    @Published private(set) var currentID: UUID?
     /// Drop entries once they have been played instead of keeping a pointer.
     @Published var consumeOnPlay: Bool = false { didSet { save() } }
     /// Shuffle applies to this list, not to Music.app. Music.app's own shuffle
@@ -24,7 +25,9 @@ final class QueueStore: ObservableObject {
 
     private var preShuffleOrder: [UUID]?
 
-    private var saveWorkItem: DispatchWorkItem?
+    @Published private(set) var persistenceError: String?
+    private let fileURL: URL
+    private var loading = false
 
     private static var storeURL: URL {
         let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
@@ -41,7 +44,10 @@ final class QueueStore: ObservableObject {
         var preShuffleOrder: [UUID]?
     }
 
-    init() { load() }
+    init(fileURL: URL? = nil) {
+        self.fileURL = fileURL ?? Self.storeURL
+        load()
+    }
 
     var currentIndex: Int? {
         guard let currentID else { return nil }
@@ -81,6 +87,7 @@ final class QueueStore: ObservableObject {
     /// Shuffles the entries after the one playing, and restores the original
     /// running order when switched back off.
     func setShuffle(_ on: Bool) {
+        guard on != shuffleActive else { return }
         if on {
             preShuffleOrder = items.map(\.id)
             if let i = currentIndex, i + 1 < items.count {
@@ -93,12 +100,15 @@ final class QueueStore: ObservableObject {
         } else if let order = preShuffleOrder {
             var rank: [UUID: Int] = [:]
             for (i, id) in order.enumerated() { rank[id] = i }
-            let known = items.filter { rank[$0.id] != nil }
-                             .sorted { rank[$0.id]! < rank[$1.id]! }
+            let boundary = currentIndex.map { $0 + 1 } ?? 0
+            let history = Array(items.prefix(boundary))
+            let pending = Array(items.dropFirst(boundary))
+            let known = pending.filter { rank[$0.id] != nil }
+                               .sorted { rank[$0.id]! < rank[$1.id]! }
             // Anything added while shuffled has no original position; keep it
             // at the end in the order it was added.
-            let added = items.filter { rank[$0.id] == nil }
-            items = known + added
+            let added = pending.filter { rank[$0.id] == nil }
+            items = history + known + added
             preShuffleOrder = nil
         }
         shuffleActive = on
@@ -108,8 +118,9 @@ final class QueueStore: ObservableObject {
     func reshuffle() {
         guard shuffleActive else { return }
         let saved = preShuffleOrder
+        shuffleActive = false
         setShuffle(true)
-        preShuffleOrder = saved ?? preShuffleOrder
+        preShuffleOrder = saved
         save()
     }
 
@@ -121,12 +132,16 @@ final class QueueStore: ObservableObject {
 
     func clearAll() {
         items.removeAll()
+        shuffleActive = false
+        preShuffleOrder = nil
         currentID = nil
         save()
     }
 
     func replaceAll(with tracks: [MusicTrack]) {
         items = tracks.map { QueueItem(track: $0) }
+        shuffleActive = false
+        preShuffleOrder = nil
         currentID = nil
         save()
     }
@@ -168,29 +183,40 @@ final class QueueStore: ObservableObject {
         return item
     }
 
-    // MARK: Persistence (debounced — drags fire a lot of mutations)
-
+    // MARK: Persistence
+    // Writes are serialized on the main actor. Each user action is durably saved
+    // before returning, including an immediate Quit after editing the queue.
     private func save() {
-        saveWorkItem?.cancel()
+        guard !loading else { return }
         let snapshot = Persisted(items: items, currentID: currentID,
                                  consumeOnPlay: consumeOnPlay,
                                  shuffleActive: shuffleActive,
                                  preShuffleOrder: preShuffleOrder)
-        let work = DispatchWorkItem {
-            guard let data = try? JSONEncoder().encode(snapshot) else { return }
-            try? data.write(to: QueueStore.storeURL, options: .atomic)
+        do {
+            let data = try JSONEncoder().encode(snapshot)
+            try FileManager.default.createDirectory(at: fileURL.deletingLastPathComponent(),
+                                                     withIntermediateDirectories: true)
+            try data.write(to: fileURL, options: .atomic)
+            persistenceError = nil
+        } catch {
+            persistenceError = "キューの保存に失敗しました: \(error.localizedDescription)"
         }
-        saveWorkItem = work
-        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 0.4, execute: work)
     }
 
     private func load() {
-        guard let data = try? Data(contentsOf: QueueStore.storeURL),
-              let p = try? JSONDecoder().decode(Persisted.self, from: data) else { return }
-        items = p.items
-        currentID = p.currentID
-        consumeOnPlay = p.consumeOnPlay ?? false
-        shuffleActive = p.shuffleActive ?? false
-        preShuffleOrder = p.preShuffleOrder
+        loading = true
+        defer { loading = false }
+        guard FileManager.default.fileExists(atPath: fileURL.path) else { return }
+        do {
+            let data = try Data(contentsOf: fileURL)
+            let p = try JSONDecoder().decode(Persisted.self, from: data)
+            items = p.items
+            currentID = items.contains { $0.id == p.currentID } ? p.currentID : nil
+            consumeOnPlay = p.consumeOnPlay ?? false
+            shuffleActive = p.shuffleActive ?? false
+            preShuffleOrder = p.preShuffleOrder
+        } catch {
+            persistenceError = "保存済みキューを読み込めません: \(error.localizedDescription)"
+        }
     }
 }

@@ -1,0 +1,13 @@
+name: macOS checks
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build and validate AppleScript
+        run: ./build.sh
+      - name: Queue and player regression checks
+        run: ./test.sh

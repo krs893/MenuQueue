@@ -6,7 +6,7 @@ cd "$(dirname "$0")"
 APP="build/MenuQueue.app"
 BIN="$APP/Contents/MacOS/MenuQueue"
 
-rm -rf build
+rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 
 cat > "$APP/Contents/Info.plist" <<'PLIST'
@@ -19,8 +19,8 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
     <key>CFBundleExecutable</key>            <string>MenuQueue</string>
     <key>CFBundleIdentifier</key>            <string>jp.local.menuqueue</string>
     <key>CFBundlePackageType</key>           <string>APPL</string>
-    <key>CFBundleShortVersionString</key>    <string>1.0</string>
-    <key>CFBundleVersion</key>               <string>1</string>
+    <key>CFBundleShortVersionString</key>    <string>1.1.0</string>
+    <key>CFBundleVersion</key>               <string>2</string>
     <key>LSMinimumSystemVersion</key>        <string>14.0</string>
     <key>LSUIElement</key>                   <true/>
     <key>NSAppleEventsUsageDescription</key>
@@ -37,15 +37,15 @@ python3 check_scripts.py
 echo "compiling…"
 swiftc \
     -swift-version 5 \
-    -target arm64-apple-macos14.0 \
+    -target "${ARCH:-$(uname -m)}-apple-macos14.0" \
     -O -whole-module-optimization \
     -framework AppKit -framework SwiftUI -framework ApplicationServices \
     -framework ServiceManagement \
     -o "$BIN" \
     Sources/*.swift
 
-# Ad-hoc signature with a stable identifier keeps the Automation/Accessibility
-# grants attached across rebuilds instead of re-prompting every time.
+# Ad-hoc signing supports local use. A changed binary may require Automation
+# or Accessibility permission again; a stable identifier alone does not prevent this.
 codesign --force --sign - --identifier jp.local.menuqueue "$APP"
 
 echo "built → $APP"

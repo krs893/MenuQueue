@@ -11,7 +11,10 @@ final class ScriptRunner {
     private let queue = DispatchQueue(label: "jp.menuqueue.applescript")
     private var cache: [String: NSAppleScript] = [:]
 
-    struct ScriptError: Error { let message: String }
+    struct ScriptError: LocalizedError {
+        let message: String
+        var errorDescription: String? { message }
+    }
 
     @discardableResult
     func run(_ source: String) throws -> NSAppleEventDescriptor {
@@ -23,6 +26,7 @@ final class ScriptRunner {
                 guard let s = NSAppleScript(source: source) else {
                     throw ScriptError(message: "script could not be created")
                 }
+                if cache.count >= 128 { cache.removeAll(keepingCapacity: true) }
                 cache[source] = s
                 script = s
             }
@@ -40,46 +44,6 @@ final class ScriptRunner {
     func string(_ source: String) throws -> String {
         try run(source).stringValue ?? ""
     }
-}
-
-// MARK: - Models
-
-struct MusicTrack: Codable, Hashable, Identifiable {
-    var id: String { "\(databaseID)" }
-    var databaseID: Int
-    var name: String
-    var artist: String
-    var album: String
-    var duration: Double
-
-    var subtitle: String {
-        [artist, album].filter { !$0.isEmpty }.joined(separator: " — ")
-    }
-}
-
-struct PlaylistInfo: Identifiable, Hashable {
-    var id: String          // persistent ID
-    var name: String
-    var count: Int
-}
-
-enum PlayerState: String {
-    case stopped, playing, paused, fastForwarding = "fast forwarding", rewinding
-    case unknown
-
-    init(appleScript raw: String) {
-        self = PlayerState(rawValue: raw.trimmingCharacters(in: .whitespaces)) ?? .unknown
-    }
-    var isPlaying: Bool { self == .playing || self == .fastForwarding || self == .rewinding }
-}
-
-struct NowPlaying {
-    var state: PlayerState = .stopped
-    var track: MusicTrack?
-    var position: Double = 0
-    var shuffle: Bool = false
-    var repeatMode: String = "off"
-    var volume: Int = 100
 }
 
 // MARK: - Music.app bridge
@@ -110,7 +74,7 @@ enum MusicBridge {
 
     on joinLines(lst)
         set od to AppleScript's text item delimiters
-        set AppleScript's text item delimiters to linefeed
+        set AppleScript's text item delimiters to (character id 29)
         set s to lst as text
         set AppleScript's text item delimiters to od
         return s
@@ -157,9 +121,9 @@ enum MusicBridge {
         let dbID = Int(f[1]) ?? 0
         if dbID != 0 {
             np.track = MusicTrack(databaseID: dbID, name: f[2], artist: f[3],
-                                  album: f[4], duration: Double(f[5]) ?? 0)
+                                  album: f[4], duration: number(f[5]))
         }
-        np.position = Double(f[6]) ?? 0
+        np.position = number(f[6])
         np.shuffle = (f[7] == "true")
         np.repeatMode = f[8]
         np.volume = Int(Double(f[9]) ?? 100)
@@ -212,12 +176,31 @@ enum MusicBridge {
 
     /// Plays a library track identified by its database ID.
     @discardableResult
-    static func play(databaseID: Int) throws -> Bool {
+    static func play(databaseID: Int, playlistID: String? = nil, validateOnly: Bool = false) throws -> Bool {
+        let pid = esc(playlistID ?? "")
+        let shouldPlay = validateOnly ? "false" : "true"
         let src = """
         tell application id "com.apple.Music"
-            set mqMatches to (every track of library playlist 1 whose database ID is \(databaseID))
+            set mqMatches to {}
+            if "\(pid)" is not "" then
+                try
+                    set mqSource to first user playlist whose persistent ID is "\(pid)"
+                    set mqMatches to (every track of mqSource whose database ID is \(databaseID))
+                end try
+            end if
+            if mqMatches is {} then
+                set mqMatches to (every track of library playlist 1 whose database ID is \(databaseID))
+            end if
+            if mqMatches is {} then
+                repeat with mqSource in (every user playlist)
+                    try
+                        set mqMatches to (every track of mqSource whose database ID is \(databaseID))
+                    end try
+                    if mqMatches is not {} then exit repeat
+                end repeat
+            end if
             if mqMatches is {} then return "notfound"
-            play (item 1 of mqMatches)
+            if \(shouldPlay) then play (item 1 of mqMatches)
             return "ok"
         end tell
         """
@@ -232,11 +215,7 @@ enum MusicBridge {
         let src = joinHandler + """
         tell application id "com.apple.Music"
             set mqOut to {}
-            try
-                set mqRes to (search library playlist 1 for "\(q)" only songs)
-            on error
-                set mqRes to {}
-            end try
+            set mqRes to (search library playlist 1 for "\(q)" only songs)
             set mqCount to (count of mqRes)
             if mqCount > \(limit) then set mqCount to \(limit)
             repeat with mqI from 1 to mqCount
@@ -266,42 +245,49 @@ enum MusicBridge {
         return my joinLines(mqOut)
         """
         let raw = try ScriptRunner.shared.string(src)
-        return raw.split(separator: "\n").compactMap { line in
+        return raw.split(separator: "\u{1D}").compactMap { line in
             let f = String(line).components(separatedBy: RS)
             guard f.count >= 3 else { return nil }
             return PlaylistInfo(id: f[0], name: f[1], count: Int(f[2]) ?? 0)
         }
     }
 
-    static func tracks(inPlaylist persistentID: String, limit: Int = 500) throws -> [MusicTrack] {
+    static func tracks(inPlaylist persistentID: String) throws -> [MusicTrack] {
         let pid = esc(persistentID)
+        // Fetch columns in bulk: five Music events regardless of playlist size.
+        // The join loop below operates entirely on local AppleScript lists.
         let src = joinHandler + """
         tell application id "com.apple.Music"
-            set mqOut to {}
-            try
-                set mqPL to (first user playlist whose persistent ID is "\(pid)")
-                set mqRes to (every track of mqPL)
-                set mqCount to (count of mqRes)
-                if mqCount > \(limit) then set mqCount to \(limit)
-                repeat with mqI from 1 to mqCount
-                    set mqTrack to item mqI of mqRes
-                    try
-                        set end of mqOut to my joinList({((database ID of mqTrack) as text), (name of mqTrack), (artist of mqTrack), (album of mqTrack), ((duration of mqTrack) as text)})
-                    end try
-                end repeat
-            end try
+            set mqPL to (first user playlist whose persistent ID is "\(pid)")
+            set mqIDs to database ID of every track of mqPL
+            set mqNames to name of every track of mqPL
+            set mqArtists to artist of every track of mqPL
+            set mqAlbums to album of every track of mqPL
+            set mqDurations to duration of every track of mqPL
         end tell
+        set mqOut to {}
+        repeat with mqI from 1 to (count of mqIDs)
+            set end of mqOut to my joinList({item mqI of mqIDs, item mqI of mqNames, item mqI of mqArtists, item mqI of mqAlbums, item mqI of mqDurations})
+        end repeat
         return my joinLines(mqOut)
         """
-        return parseTracks(try ScriptRunner.shared.string(src))
+        return parseTracks(try ScriptRunner.shared.string(src)).map {
+            var track = $0
+            track.sourcePlaylistID = persistentID
+            return track
+        }
+    }
+
+    private static func number(_ text: String) -> Double {
+        Double(text.replacingOccurrences(of: ",", with: ".")) ?? 0
     }
 
     private static func parseTracks(_ raw: String) -> [MusicTrack] {
-        raw.split(separator: "\n").compactMap { line in
+        raw.split(separator: "\u{1D}").compactMap { line in
             let f = String(line).components(separatedBy: RS)
             guard f.count >= 5, let id = Int(f[0]) else { return nil }
             return MusicTrack(databaseID: id, name: f[1], artist: f[2],
-                              album: f[3], duration: Double(f[4]) ?? 0)
+                              album: f[3], duration: number(f[4]))
         }
     }
 }
