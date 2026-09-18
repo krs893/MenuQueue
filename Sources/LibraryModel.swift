@@ -87,13 +87,13 @@ final class UpNextModel: ObservableObject {
     @Published var loading = false
     @Published var lastRead: Date?
 
-    func refresh() {
+    func refresh(openIfNeeded: Bool = false) {
         guard !loading else { return }
         loading = true
         error = nil
         Task { [weak self] in
             let outcome: Result<[UpNextRow], Error> = await Task.detached(priority: .userInitiated) {
-                do { return .success(try UpNextReader.read()) }
+                do { return .success(try UpNextReader.read(openIfNeeded: openIfNeeded)) }
                 catch { return .failure(error) }
             }.value
             guard let self else { return }

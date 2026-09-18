@@ -11,6 +11,8 @@ enum MusicBridge {
     static var plays: [Int] = []
     static var missing = false
     static var nativeNextCount = 0
+    static var lastPlaylist: String?
+    static func playPlaylist(_ id: String) throws { lastPlaylist = id; snapshot.state = .playing }
     static var delay: Double = 0
     static func nowPlaying() throws -> NowPlaying { snapshot }
     static func artworkOfCurrentTrack() -> NSImage? { nil }

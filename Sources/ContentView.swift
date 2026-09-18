@@ -10,14 +10,14 @@ func timeString(_ seconds: Double) -> String {
 
 enum Tab: String, CaseIterable, Identifiable {
     case queue = "キュー"
-    case add = "曲を追加"
-    case upNext = "Musicの次に再生"
+    case search = "検索"
+    case playlists = "プレイリスト"
     var id: String { rawValue }
     var icon: String {
         switch self {
         case .queue: return "list.bullet"
-        case .add: return "plus.circle"
-        case .upNext: return "music.note.list"
+        case .search: return "magnifyingglass"
+        case .playlists: return "music.note.list"
         }
     }
 }
@@ -51,15 +51,17 @@ struct ContentView: View {
 
                 Group {
                     switch tab {
-                    case .queue:  QueueTab(player: player, store: store, addTracks: { tab = .add })
-                    case .upNext: UpNextTab(model: upNext)
-                    case .add:    AddTab(library: library, store: store, player: player, showQueue: { tab = .queue })
+                    case .queue: UpNextTab(model: upNext)
+                        .task(id: player.now.track?.databaseID) { upNext.refresh(openIfNeeded: true) }
+                    case .search: LibraryTab(library: library, player: player, mode: .search)
+                    case .playlists: LibraryTab(library: library, player: player, mode: .playlists)
+
                     }
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
 
-            if let err = player.lastError ?? store.persistenceError {
+            if let err = player.lastError {
                 HStack {
                     Spacer()
                     Image(systemName: "exclamationmark.triangle.fill")
@@ -72,7 +74,7 @@ struct ContentView: View {
             library.loadPlaylists()
         }
         .onChange(of: tab) { _, newValue in
-            if newValue == .add { library.loadPlaylists() }
+            if newValue == .playlists { library.loadPlaylists() }
         }
     }
 }
@@ -209,131 +211,7 @@ struct TransportBar: View {
     }
 }
 
-// MARK: - Queue
-
-struct QueueTab: View {
-    @ObservedObject var player: PlayerController
-    @ObservedObject var store: QueueStore
-    let addTracks: () -> Void
-
-    var body: some View {
-        VStack(spacing: 0) {
-            HStack(spacing: 8) {
-                Image(systemName: "list.bullet").foregroundStyle(.secondary)
-                Text("\(store.items.count)").font(.subheadline).monospacedDigit().foregroundStyle(.secondary)
-                if store.shuffleActive {
-                    Image(systemName: "shuffle").help("シャッフル")
-                        .font(.system(size: 9))
-                        .foregroundStyle(.tint)
-                    Button { store.reshuffle() } label: { Image(systemName: "arrow.clockwise") }
-                        .help("引き直す")
-                }
-                Spacer()
-                Button {
-                    Task { await player.startQueueFromTop() }
-                } label: { Image(systemName: "play.fill").frame(width: 24, height: 20) }
-                    .buttonStyle(.borderedProminent)
-                    .disabled(store.items.isEmpty)
-                Menu {
-                    Button("次に流れる曲をすべて削除") { store.clearUpcoming() }
-                    Button("キューを空にする", role: .destructive) { Task { await player.clearQueue() } }
-                } label: { Image(systemName: "ellipsis.circle") }
-                    .menuStyle(.borderlessButton)
-                    .frame(width: 26)
-            }
-            .buttonStyle(.borderless)
-            .font(.caption)
-            .padding(.horizontal, 10)
-            .padding(.bottom, 6)
-
-            if store.items.isEmpty {
-                Button(action: addTracks) {
-                    Image(systemName: "plus.circle.fill")
-                        .font(.system(size: 46, weight: .light))
-                        .symbolRenderingMode(.hierarchical)
-                }.buttonStyle(.plain).help("曲を追加")
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-            } else {
-                List {
-                    ForEach(Array(store.items.enumerated()), id: \.element.id) { index, item in
-                        QueueRow(index: index, item: item,
-                                 isCurrent: player.owns && item.id == store.currentID,
-                                 isPast: isPast(index))
-                            .contentShape(Rectangle())
-                            .onTapGesture(count: 2) { Task { await player.play(item: item) } }
-                            .contextMenu {
-                                Button("今すぐ再生") { Task { await player.play(item: item) } }
-                                Button("次に再生へ移動") { moveToNext(item) }
-                                    .disabled(item.id == store.currentID)
-                                Divider()
-                                Button("削除", role: .destructive) { store.remove(ids: [item.id]) }
-                                    .disabled(item.id == store.currentID)
-                            }
-                    }
-                    .onMove { store.move(from: $0, to: $1) }
-                }
-                .listStyle(.plain)
-                Divider()
-                HStack {
-                    Image(systemName: "hand.draw")
-                        .foregroundStyle(.tertiary).help("ドラッグで並べ替え、ダブルクリックで再生")
-                    Spacer()
-                    Button(action: addTracks) { Image(systemName: "plus").frame(width: 28, height: 24) }.help("曲を追加")
-                        .buttonStyle(.borderedProminent)
-                }.padding(10)
-            }
-        }
-    }
-
-    private func isPast(_ index: Int) -> Bool {
-        guard player.owns, let current = store.currentIndex else { return false }
-        return index < current
-    }
-
-    private func moveToNext(_ item: QueueItem) {
-        guard let from = store.items.firstIndex(where: { $0.id == item.id }) else { return }
-        let target = (store.currentIndex.map { $0 + 1 }) ?? 0
-        guard from != target else { return }
-        store.move(from: IndexSet(integer: from), to: target)
-    }
-}
-
-struct QueueRow: View {
-    let index: Int
-    let item: QueueItem
-    let isCurrent: Bool
-    let isPast: Bool
-
-    var body: some View {
-        HStack(spacing: 8) {
-            Group {
-                if isCurrent {
-                    Image(systemName: "speaker.wave.2.fill").foregroundStyle(.tint)
-                } else {
-                    Text("\(index + 1)").font(.system(size: 10, design: .monospaced))
-                        .foregroundStyle(.tertiary)
-                }
-            }
-            .frame(width: 18)
-
-            VStack(alignment: .leading, spacing: 1) {
-                Text(item.track.name).font(.system(size: 14, weight: isCurrent ? .semibold : .regular)).lineLimit(1)
-                Text(item.track.subtitle).font(.system(size: 12)).foregroundStyle(.secondary).lineLimit(1)
-            }
-            Spacer(minLength: 4)
-            Text(timeString(item.track.duration))
-                .font(.system(size: 10, design: .monospaced))
-                .foregroundStyle(.tertiary)
-            Image(systemName: "line.3.horizontal")
-                .font(.system(size: 9))
-                .foregroundStyle(.quaternary)
-        }
-        .opacity(isPast ? 0.65 : 1)
-        .padding(.vertical, 6)
-    }
-}
-
-// MARK: - Up Next (read-only, via Accessibility)
+// MARK: - Current Music queue
 
 struct UpNextTab: View {
     @ObservedObject var model: UpNextModel
@@ -344,7 +222,7 @@ struct UpNextTab: View {
                 Image(systemName: "eye").foregroundStyle(.secondary).help("Music側のキュー・読み取り専用")
                 Spacer()
                 if model.loading { ProgressView().controlSize(.small) }
-                Button { model.refresh() } label: { Image(systemName: "arrow.clockwise") }
+                Button { model.refresh(openIfNeeded: true) } label: { Image(systemName: "arrow.clockwise") }
                     .buttonStyle(.borderless)
                     .disabled(model.loading)
             }
@@ -365,9 +243,9 @@ struct UpNextTab: View {
             } else {
                 List(model.rows) { row in
                     VStack(alignment: .leading, spacing: 1) {
-                        Text(row.title).font(.system(size: 12)).lineLimit(1)
+                        Text(row.title).font(.system(size: 14)).lineLimit(1)
                         if !row.subtitle.isEmpty {
-                            Text(row.subtitle).font(.system(size: 10)).foregroundStyle(.secondary).lineLimit(1)
+                            Text(row.subtitle).font(.system(size: 12)).foregroundStyle(.secondary).lineLimit(1)
                         }
                     }
                 }
@@ -379,23 +257,14 @@ struct UpNextTab: View {
 
 // MARK: - Add
 
-struct AddTab: View {
+struct LibraryTab: View {
     @ObservedObject var library: LibraryModel
-    @ObservedObject var store: QueueStore
     @ObservedObject var player: PlayerController
-    let showQueue: () -> Void
-    @State private var mode = 0
+    let mode: Tab
 
     var body: some View {
         VStack(spacing: 0) {
-            Picker("", selection: $mode) {
-                Image(systemName: "magnifyingglass").help("検索").tag(0)
-                Image(systemName: "music.note.list").help("プレイリスト").tag(1)
-            }
-            .pickerStyle(.segmented).labelsHidden()
-            .padding(.horizontal, 10).padding(.bottom, 6)
-
-            if mode == 0 {
+            if mode == .search {
                 if let error = library.searchError {
                     Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange).help(error).padding(10)
                 }
@@ -415,13 +284,7 @@ struct AddTab: View {
                 }
                 playlistSection
             }
-            Divider()
-            HStack {
-                Image(systemName: "list.bullet").foregroundStyle(.secondary)
-                Text("\(store.items.count)").font(.subheadline).monospacedDigit().foregroundStyle(.secondary)
-                Spacer()
-                Button(action: showQueue) { Image(systemName: "arrow.right").frame(width: 28, height: 24) }.buttonStyle(.bordered).help("キューを見る")
-            }.padding(10)
+
         }
     }
 
@@ -441,9 +304,7 @@ struct AddTab: View {
             EmptyHint(icon: "magnifyingglass", text: library.isSearching ? "検索中…" : library.query.isEmpty ? "ライブラリから聴きたい曲を探す" : "一致する曲がありません")
         } else {
             List(library.results) { track in
-                TrackPickRow(track: track,
-                             addEnd: { store.append([track]) },
-                             addNext: { store.playNext([track]) })
+                TrackPickRow(track: track, play: { Task { await player.playNative(track) } })
             }
             .listStyle(.plain)
         }
@@ -458,14 +319,10 @@ struct AddTab: View {
                 Text(selected.name).font(.subheadline).bold().lineLimit(1)
                 Text("\(library.playlistTracks.count)").font(.caption).foregroundStyle(.secondary)
                 Spacer()
-                Button { store.append(library.playlistTracks) } label: { Image(systemName: "text.badge.plus") }
-                    .help("すべてキューに追加")
-                    .controlSize(.small)
-                    .disabled(library.playlistTracks.isEmpty)
                 Button {
-                    Task { await player.replaceQueue(with: library.playlistTracks) }
+                    Task { await player.playNativePlaylist(selected.id) }
                 } label: { Image(systemName: "play.fill") }
-                .help("このプレイリストでキューを置き換えて再生")
+                .help("このプレイリストをMusicで再生")
                 .controlSize(.small)
                 .disabled(library.playlistTracks.isEmpty)
             }
@@ -476,9 +333,7 @@ struct AddTab: View {
                           text: library.isLoadingTracks ? "読み込み中…" : "このプレイリストは空です")
             } else {
                 List(library.playlistTracks) { track in
-                    TrackPickRow(track: track,
-                                 addEnd: { store.append([track]) },
-                                 addNext: { store.playNext([track]) })
+                    TrackPickRow(track: track, play: { Task { await player.playNative(track) } })
                 }
                 .listStyle(.plain)
             }
@@ -502,9 +357,7 @@ struct AddTab: View {
 
 struct TrackPickRow: View {
     let track: MusicTrack
-    let addEnd: () -> Void
-    let addNext: () -> Void
-    @State private var added = false
+    let play: () -> Void
 
     var body: some View {
         HStack(spacing: 6) {
@@ -513,15 +366,14 @@ struct TrackPickRow: View {
                 Text(track.subtitle).font(.system(size: 11)).foregroundStyle(.secondary).lineLimit(1)
             }
             Spacer(minLength: 4)
-            Button { addNext(); added = true } label: { Image(systemName: "text.insert").frame(width: 28, height: 28) }
-                .help("次に再生")
-            Button { addEnd(); added = true } label: {
-                Image(systemName: added ? "checkmark.circle.fill" : "plus.circle").font(.system(size: 18)).frame(width: 32, height: 32)
-            }
-                .help("キューの最後に追加")
+            Button(action: play) {
+                Image(systemName: "play.fill").frame(width: 32, height: 32)
+            }.help("再生").accessibilityLabel("再生")
         }
         .buttonStyle(.borderless)
         .font(.system(size: 12))
+        .contentShape(Rectangle())
+        .onTapGesture(count: 2, perform: play)
     }
 }
 
@@ -561,17 +413,6 @@ struct SettingsPanel: View {
                 }
                 if let error = loginItemError {
                     Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange).help(error)
-                }
-                Divider()
-                HStack {
-                    Image(systemName: "trash").frame(width: 28).help("再生済みの曲を削除")
-                    Spacer()
-                    Toggle("再生済みの曲を削除", isOn: $store.consumeOnPlay).labelsHidden()
-                }
-                HStack {
-                    Image(systemName: "forward.end").frame(width: 28).help("曲の切り替えを安定させる")
-                    Spacer()
-                    Toggle("曲の切り替えを安定させる", isOn: $player.gaplessTakeover).labelsHidden()
                 }
                 Divider()
                 HStack {

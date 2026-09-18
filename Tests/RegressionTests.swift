@@ -115,6 +115,13 @@ struct RegressionTests {
                "Native Music playback must not be hijacked by a dormant queue")
         print("PASS: rapid next clicks are preserved; native playback uses native next")
 
+        assert(!player.shuffleTargetsQueue, "A saved custom queue must not redirect Music shuffle")
+        await player.playNative(tracks[1])
+        assert(!player.owns && MusicBridge.plays.last == tracks[1].databaseID)
+        await player.playNativePlaylist("playlist-test")
+        assert(!player.owns && MusicBridge.lastPlaylist == "playlist-test")
+        print("PASS: search and playlists use native Music playback")
+
         let displays: [CGRect] = [
             CGRect(x: 0, y: 0, width: 1440, height: 900),
             CGRect(x: -1920, y: 0, width: 1920, height: 1080),

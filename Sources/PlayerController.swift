@@ -266,16 +266,37 @@ final class PlayerController: ObservableObject {
         if restored != nil { savedRepeat = nil }
     }
 
+    // Search and playlists operate on Music's actual queue.
+    func playNative(_ track: MusicTrack) async {
+        guard !transitioning else { return }
+        transitioning = true
+        revision += 1
+        defer { transitioning = false }
+        await releaseOwnership()
+        lastError = nil
+        let ok = await bridge { try MusicBridge.play(databaseID: track.databaseID,
+                                                     playlistID: track.sourcePlaylistID) }
+        if ok == false { lastError = "曲を見つけられません: \(track.name)" }
+        pollInterval = 0.3
+    }
+
+    func playNativePlaylist(_ id: String) async {
+        guard !transitioning else { return }
+        transitioning = true
+        revision += 1
+        defer { transitioning = false }
+        await releaseOwnership()
+        lastError = nil
+        _ = await bridge { try MusicBridge.playPlaylist(id) }
+        pollInterval = 0.3
+    }
+
     // MARK: - Transport exposed to the UI
 
     func togglePlayPause() {
         Task {
             guard !transitioning, !advancing else { return }
-            if !owns && now.state == .stopped && !store.items.isEmpty {
-                await startQueueFromTop()
-            } else {
-                _ = await bridge({ try MusicBridge.playPause() })
-            }
+            _ = await bridge({ try MusicBridge.playPause() })
             await tick()
         }
     }
@@ -333,7 +354,7 @@ final class PlayerController: ObservableObject {
 
     /// With a queue loaded, shuffling Music.app would do nothing — we hand it
     /// single tracks — so the button shuffles our own list instead.
-    var shuffleTargetsQueue: Bool { !store.items.isEmpty }
+    var shuffleTargetsQueue: Bool { owns && !store.items.isEmpty }
 
     var shuffleIsOn: Bool { shuffleTargetsQueue ? store.shuffleActive : now.shuffle }
 

@@ -1,6 +1,5 @@
 import AppKit
 import SwiftUI
-import Combine
 
 @MainActor
 final class MenuPanel: NSPanel {
@@ -20,18 +19,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var globalMonitor: Any?
     private var store: QueueStore!
     private var player: PlayerController!
-    private var cancellables = Set<AnyCancellable>()
     private var playerWindow: NSWindow?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         store = QueueStore()
         player = PlayerController(store: store)
 
-        statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         if let button = statusItem.button {
             button.image = NSImage(systemSymbolName: "music.note.list", accessibilityDescription: "MenuQueue")
             button.image?.isTemplate = true
-            button.imagePosition = .imageLeading
+            button.imagePosition = .imageOnly
             button.target = self
             button.action = #selector(statusItemClicked(_:))
             button.sendAction(on: [.leftMouseUp, .rightMouseUp])
@@ -60,10 +58,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NotificationCenter.default.addObserver(self, selector: #selector(displaysChanged),
             name: NSApplication.didChangeScreenParametersNotification, object: nil)
 
-        player.$now
-            .receive(on: RunLoop.main)
-            .sink { [weak self] np in self?.updateTitle(np) }
-            .store(in: &cancellables)
         if CommandLine.arguments.contains("--window") { showPlayerWindow() }
     }
 
@@ -71,22 +65,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         dismissPanel()
         NotificationCenter.default.removeObserver(self)
         player?.shutdown()
-    }
-
-    private func updateTitle(_ np: NowPlaying) {
-        guard let button = statusItem.button else { return }
-        guard np.state.isPlaying || np.state == .paused, let track = np.track else {
-            button.title = ""
-            return
-        }
-        var label = track.name
-        if !track.artist.isEmpty { label += " — " + track.artist }
-        if label.count > 30 { label = String(label.prefix(29)) + "…" }
-        let attrs: [NSAttributedString.Key: Any] = [
-            .font: NSFont.systemFont(ofSize: 12),
-            .foregroundColor: np.state == .paused ? NSColor.secondaryLabelColor : NSColor.labelColor
-        ]
-        button.attributedTitle = NSAttributedString(string: " " + label, attributes: attrs)
     }
 
     @objc private func statusItemClicked(_ sender: NSStatusBarButton) {

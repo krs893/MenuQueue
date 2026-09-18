@@ -207,6 +207,17 @@ enum MusicBridge {
         return try ScriptRunner.shared.string(src) == "ok"
     }
 
+    static func playPlaylist(_ persistentID: String) throws {
+        let pid = esc(persistentID)
+        let src = """
+        tell application id "com.apple.Music"
+            set mqPlaylist to first user playlist whose persistent ID is "\(pid)"
+            play mqPlaylist
+        end tell
+        """
+        try ScriptRunner.shared.run(src)
+    }
+
     // MARK: Library browsing
 
     static func search(_ query: String, limit: Int = 60) throws -> [MusicTrack] {

@@ -107,7 +107,7 @@ enum UpNextReader {
 
     /// Opens Music.app's Up Next popover, scrapes it, and closes it again.
     /// Must be called off the main thread.
-    static func read() throws -> [UpNextRow] {
+    static func read(openIfNeeded: Bool = false) throws -> [UpNextRow] {
         guard isTrusted else { throw ReadError.notTrusted }
         guard let app = NSRunningApplication
             .runningApplications(withBundleIdentifier: MusicBridge.bundleID).first
@@ -142,6 +142,7 @@ enum UpNextReader {
             if opened { AXUIElementPerformAction(button, kAXPressAction as CFString) }
         }
         if target == nil {
+            guard openIfNeeded else { throw ReadError.listNotFound }
             // Do not choose an arbitrary library table: only a labelled queue
             // or a uniquely identifiable list that appeared after opening it.
             let alreadyOpen = (attr(button, kAXValueAttribute) as? NSNumber)?.boolValue == true
@@ -172,7 +173,6 @@ enum UpNextReader {
             result.append(UpNextRow(title: title, subtitle: subtitle))
         }
 
-        if result.isEmpty { throw ReadError.listNotFound }
         return result
     }
 }
