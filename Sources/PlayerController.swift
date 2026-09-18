@@ -23,6 +23,10 @@ final class PlayerController: ObservableObject {
     @Published var lastError: String?
     @Published private(set) var pendingSkipCount = 0
     private var skipTask: Task<Void, Never>?
+    @Published private var requestedShuffle: Bool?
+    private var shuffleTask: Task<Void, Never>?
+    private var shuffleRequestVersion = 0
+    var isShuffleChanging: Bool { requestedShuffle != nil }
 
     @Published var gaplessTakeover: Bool = UserDefaults.standard.object(forKey: "gaplessTakeover") as? Bool ?? true {
         didSet {
@@ -79,6 +83,7 @@ final class PlayerController: ObservableObject {
     func shutdown() {
         loopTask?.cancel()
         skipTask?.cancel()
+        shuffleTask?.cancel()
         if let observer { DistributedNotificationCenter.default().removeObserver(observer) }
         // Termination must not leave an unawaited task restoring repeat after exit.
         if let saved = savedRepeat, MusicBridge.isRunning {
@@ -356,15 +361,48 @@ final class PlayerController: ObservableObject {
     /// single tracks — so the button shuffles our own list instead.
     var shuffleTargetsQueue: Bool { owns && !store.items.isEmpty }
 
-    var shuffleIsOn: Bool { shuffleTargetsQueue ? store.shuffleActive : now.shuffle }
+    var shuffleIsOn: Bool { shuffleTargetsQueue ? store.shuffleActive : (requestedShuffle ?? now.shuffle) }
 
     func toggleShuffle() {
         if shuffleTargetsQueue {
             store.setShuffle(!store.shuffleActive)
-        } else {
-            let target = !now.shuffle
-            now.shuffle = target
-            Task { _ = await bridge({ try MusicBridge.setShuffle(target) }); await tick() }
+            return
+        }
+        // Toggle the user's latest intent, never a poll that may be out of date.
+        lastError = nil
+        requestedShuffle = !(requestedShuffle ?? now.shuffle)
+        shuffleRequestVersion += 1
+        revision += 1
+        guard shuffleTask == nil else { return }
+        shuffleTask = Task {
+            defer { shuffleTask = nil; requestedShuffle = nil }
+            while !Task.isCancelled {
+                let version = shuffleRequestVersion
+                // Coalesce a burst into its final on/off state. Only one Music
+                // write can be in flight; newer clicks remain pending meanwhile.
+                do { try await Task.sleep(nanoseconds: 120_000_000) }
+                catch { return }
+                while transitioning || advancing {
+                    do { try await Task.sleep(nanoseconds: 30_000_000) }
+                    catch { return }
+                }
+                guard !Task.isCancelled else { return }
+                if version != shuffleRequestVersion { continue }
+                guard let target = requestedShuffle else { return }
+                let applied: Void? = await bridge { try MusicBridge.setShuffle(target) }
+                // Discard polls captured before this write finished, including
+                // polls that were started after the user's latest click.
+                revision += 1
+                guard !Task.isCancelled else { return }
+                if applied != nil {
+                    now.shuffle = target
+                    if requestedShuffle == target { return }
+                } else if version == shuffleRequestVersion {
+                    // Leave the last confirmed state visible; a new click can
+                    // retry normally. bridge() retains the error for the UI.
+                    return
+                }
+            }
         }
     }
 

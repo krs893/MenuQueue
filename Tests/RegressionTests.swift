@@ -122,6 +122,73 @@ struct RegressionTests {
         assert(!player.owns && MusicBridge.lastPlaylist == "playlist-test")
         print("PASS: search and playlists use native Music playback")
 
+        // Every click affects the final parity, but each burst sends only one
+        // write. In-flight reads and writes must not reset that pending intent.
+        func settleShuffle() async throws {
+            let deadline = Date().addingTimeInterval(5)
+            while player.isShuffleChanging && Date() < deadline {
+                try await Task.sleep(nanoseconds: 5_000_000)
+            }
+            assert(!player.isShuffleChanging, "Shuffle worker failed to settle")
+        }
+        func awaitSignal(_ signal: TestSignal) async throws {
+            let deadline = Date().addingTimeInterval(5)
+            while !signal.consume() {
+                assert(Date() < deadline, "Music adapter never started the expected operation")
+                try await Task.sleep(nanoseconds: 5_000_000)
+            }
+        }
+        for initial in [false, true] {
+            for clicks in [10, 11] {
+                MusicBridge.snapshot.shuffle = initial
+                await player.tick()
+                let count = MusicBridge.shuffleWrites.count
+                for _ in 0..<clicks { player.toggleShuffle() }
+                let expected = clicks % 2 == 0 ? initial : !initial
+                assert(player.shuffleIsOn == expected)
+                await player.tick() // Poll old state while the write is pending.
+                assert(player.shuffleIsOn == expected, "Polling reset pending intent")
+                try await settleShuffle()
+                assert(player.shuffleIsOn == expected && MusicBridge.snapshot.shuffle == expected)
+                assert(MusicBridge.shuffleWrites.count == count + 1, "Burst issued redundant writes")
+            }
+        }
+        print("PASS: shuffle burst parity from both states; pending intent survives polls")
+
+        MusicBridge.snapshot.shuffle = false
+        await player.tick()
+        while MusicBridge.shuffleStarted.consume() {}
+        MusicBridge.shuffleDelay = 0.12
+        player.toggleShuffle()
+        try await awaitSignal(MusicBridge.shuffleStarted)
+        player.toggleShuffle() // Change intent while the first Music write waits.
+        try await settleShuffle()
+        assert(!player.shuffleIsOn && !MusicBridge.snapshot.shuffle)
+        MusicBridge.shuffleDelay = 0
+        print("PASS: latest shuffle click wins during a delayed write")
+
+        player.toggleShuffle()
+        while MusicBridge.readStarted.consume() {}
+        MusicBridge.readDelay = 0.3
+        let stalePoll = Task { await player.tick() }
+        try await awaitSignal(MusicBridge.readStarted)
+        try await settleShuffle()
+        await stalePoll.value
+        MusicBridge.readDelay = 0
+        assert(player.shuffleIsOn && MusicBridge.snapshot.shuffle, "Stale poll overwrote acknowledged state")
+        print("PASS: late polling results cannot undo shuffle confirmation")
+
+        MusicBridge.failShuffle = true
+        player.toggleShuffle()
+        try await settleShuffle()
+        assert(player.shuffleIsOn && player.lastError != nil, "Failure must restore confirmed state")
+        MusicBridge.failShuffle = false
+        player.toggleShuffle()
+        try await settleShuffle()
+        assert(!player.shuffleIsOn && !MusicBridge.snapshot.shuffle)
+        assert(player.lastError == nil)
+        print("PASS: shuffle failure rolls back; the next click retries")
+
         let displays: [CGRect] = [
             CGRect(x: 0, y: 0, width: 1440, height: 900),
             CGRect(x: -1920, y: 0, width: 1920, height: 1080),

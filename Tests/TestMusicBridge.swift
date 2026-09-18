@@ -3,6 +3,19 @@ import AppKit
 
 // This executable substitutes the Music adapter so regression checks cannot
 // change the user's actual playback, library, volume or repeat mode.
+final class TestSignal {
+    private let lock = NSLock()
+    private var pending = 0
+    func signal() { lock.lock(); defer { lock.unlock() }; pending += 1 }
+    // Nonblocking observation, safe to call from the main actor.
+    func consume() -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        guard pending > 0 else { return false }
+        pending -= 1
+        return true
+    }
+}
+
 enum MusicBridge {
     static let bundleID = "com.apple.Music"
     static var isRunning = true
@@ -14,7 +27,20 @@ enum MusicBridge {
     static var lastPlaylist: String?
     static func playPlaylist(_ id: String) throws { lastPlaylist = id; snapshot.state = .playing }
     static var delay: Double = 0
-    static func nowPlaying() throws -> NowPlaying { snapshot }
+    static var readDelay: Double = 0
+    static var shuffleDelay: Double = 0
+    static var shuffleWrites: [Bool] = []
+    static var failShuffle = false
+    static let shuffleStarted = TestSignal()
+    static let readStarted = TestSignal()
+    enum TestError: Error { case shuffleFailed }
+    static func nowPlaying() throws -> NowPlaying {
+        let captured = snapshot
+        let wait = readDelay
+        readStarted.signal()
+        Thread.sleep(forTimeInterval: wait)
+        return captured
+    }
     static func artworkOfCurrentTrack() -> NSImage? { nil }
     static func setRepeat(_ mode: String) throws { repeatWrites.append(mode); snapshot.repeatMode = mode }
     static func play(databaseID: Int, playlistID: String? = nil) throws -> Bool {
@@ -30,7 +56,15 @@ enum MusicBridge {
     static func playPause() throws { snapshot.state = snapshot.state.isPlaying ? .paused : .playing }
     static func seek(to value: Double) throws { snapshot.position = value }
     static func setVolume(_ value: Int) throws { snapshot.volume = value }
-    static func setShuffle(_ value: Bool) throws { snapshot.shuffle = value }
+    static func setShuffle(_ value: Bool) throws {
+        let wait = shuffleDelay
+        let fail = failShuffle
+        shuffleStarted.signal()
+        Thread.sleep(forTimeInterval: wait)
+        if fail { throw TestError.shuffleFailed }
+        shuffleWrites.append(value)
+        snapshot.shuffle = value
+    }
     static func nativeNext() throws { nativeNextCount += 1 }
     static func nativePrev() throws {}
 }

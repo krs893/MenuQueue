@@ -171,6 +171,11 @@ struct TransportBar: View {
             Button { player.toggleShuffle() } label: {
                 Image(systemName: "shuffle")
                     .foregroundStyle(player.shuffleIsOn ? AnyShapeStyle(.tint) : AnyShapeStyle(.secondary))
+                    .overlay(alignment: .bottomTrailing) {
+                        if player.isShuffleChanging {
+                            Circle().fill(Color.accentColor).frame(width: 4, height: 4).offset(x: 5, y: 4)
+                        }
+                    }
             }
             .help(player.shuffleTargetsQueue
                   ? "キューをシャッフル（並びはキュータブに反映されます）"
