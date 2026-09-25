@@ -24,6 +24,11 @@ struct PlaylistInfo: Identifiable, Hashable {
     var id: String          // persistent ID
     var name: String
     var count: Int
+    /// The folder this sits in, if any. Music lets playlists be nested, and a
+    /// flat list throws that structure away.
+    var parentID: String? = nil
+    /// Folders hold other playlists rather than tracks.
+    var isFolder: Bool = false
 }
 
 enum PlayerState: String {

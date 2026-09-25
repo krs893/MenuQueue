@@ -217,12 +217,16 @@ struct LibraryTab: View {
     var body: some View {
         VStack(spacing: 0) {
             HStack(spacing: 8) {
-                if let selected = library.selectedPlaylist {
-                    Button { library.selectedPlaylist = nil } label: {
+                if library.canGoBack {
+                    Button { library.goBack() } label: {
                         Image(systemName: "chevron.left").frame(width: controlSize, height: controlSize)
                     }.help("戻る")
-                    Text(selected.name).font(.subheadline).bold().lineLimit(1)
+                }
+                if let title = library.selectedPlaylist?.name ?? library.currentFolder?.name {
+                    Text(title).font(.subheadline).bold().lineLimit(1)
                         .frame(maxWidth: .infinity, alignment: .leading).layoutPriority(-1)
+                }
+                if let selected = library.selectedPlaylist {
                     // "Add to queue" is gone: it drove Music's toolbar menu
                     // through Accessibility, and on macOS 26 that toolbar
                     // exposes no children at all, so it never added anything.
@@ -231,7 +235,8 @@ struct LibraryTab: View {
                     } label: { Image(systemName: "play.fill").frame(width: controlSize, height: controlSize) }
                     .help("プレイリストを再生").accessibilityLabel("プレイリストを再生")
                     .disabled(library.playlistTracks.isEmpty)
-                } else { Spacer() }
+                }
+                Spacer(minLength: 0)
                 Button {
                     library.reloadEverything()
                 } label: {
@@ -268,18 +273,31 @@ struct LibraryTab: View {
                 }
                 .listStyle(.plain)
             }
-        } else if library.playlists.isEmpty {
-            EmptyHint(icon: "music.note.list", text: library.isLoadingPlaylists ? "読み込み中…" : "プレイリストが見つかりません")
+        } else if library.visibleEntries.isEmpty {
+            EmptyHint(icon: "music.note.list",
+                      text: library.isLoadingPlaylists ? "読み込み中…"
+                          : library.currentFolder == nil ? "プレイリストが見つかりません"
+                          : "このフォルダは空です")
         } else {
-            List(library.playlists) { pl in
+            List(library.visibleEntries) { entry in
                 HStack {
-                    Image(systemName: "music.note.list").foregroundStyle(.secondary).font(.system(size: 11))
-                    Text(pl.name).font(.system(size: 12)).lineLimit(1)
+                    Image(systemName: entry.isFolder ? "folder" : "music.note.list")
+                        .foregroundStyle(.secondary).font(.system(size: 11))
+                        .frame(width: 16)
+                    Text(entry.name).font(.system(size: 12)).lineLimit(1)
                     Spacer()
-                    Text("\(pl.count)").font(.system(size: 10, design: .monospaced)).foregroundStyle(.tertiary)
+                    Text("\(entry.isFolder ? library.childCount(of: entry) : entry.count)")
+                        .font(.system(size: 10, design: .monospaced)).foregroundStyle(.tertiary)
+                    if entry.isFolder {
+                        Image(systemName: "chevron.right")
+                            .font(.system(size: 9)).foregroundStyle(.tertiary)
+                    }
                 }
                 .contentShape(Rectangle())
-                .onTapGesture { library.loadTracks(of: pl) }
+                .onTapGesture {
+                    if entry.isFolder { library.enter(entry) } else { library.loadTracks(of: entry) }
+                }
+                .help(entry.isFolder ? "フォルダを開く" : "プレイリストを開く")
             }
             .listStyle(.plain)
         }

@@ -203,6 +203,43 @@ struct RegressionTests {
                "a non-square cover must come out square, not stretched")
         print("PASS: album art is cached per album and stored as a thumbnail")
 
+        // Playlist folders: Music nests playlists, and a flat list loses that.
+        let folderA = PlaylistInfo(id: "F1", name: "Rock in Japan", count: 0, parentID: nil, isFolder: true)
+        let folderB = PlaylistInfo(id: "F2", name: "月の曲", count: 0, parentID: nil, isFolder: true)
+        let nested  = PlaylistInfo(id: "F3", name: "nested", count: 0, parentID: "F1", isFolder: true)
+        let inA     = PlaylistInfo(id: "P1", name: "Chevon", count: 9, parentID: "F1")
+        let inNested = PlaylistInfo(id: "P2", name: "deep", count: 3, parentID: "F3")
+        let top     = PlaylistInfo(id: "P3", name: "SUKI", count: 271, parentID: nil)
+        let model = LibraryModel()
+        model.playlists = [inA, folderA, top, folderB, nested, inNested]
+
+        // Folders come first, and only what belongs at this level is listed.
+        assert(model.visibleEntries.map(\PlaylistInfo.id) == ["F1", "F2", "P3"],
+               "top level: \(model.visibleEntries.map(\PlaylistInfo.name))")
+        assert(model.childCount(of: folderA) == 2)
+        assert(!model.canGoBack)
+
+        model.enter(folderA)
+        assert(model.visibleEntries.map(\PlaylistInfo.id) == ["F3", "P1"])
+        assert(model.currentFolder?.id == "F1" && model.canGoBack)
+        model.enter(nested)
+        assert(model.visibleEntries.map(\PlaylistInfo.id) == ["P2"], "folders nest arbitrarily deep")
+        // Entering a playlist is not entering a folder.
+        model.enter(inNested)
+        assert(model.currentFolder?.id == "F3")
+
+        assert(model.goBack() && model.currentFolder?.id == "F1")
+        assert(model.goBack() && model.currentFolder == nil)
+        assert(!model.goBack(), "nowhere left to go")
+
+        // A folder that disappears from Music must not strand the panel inside it.
+        model.enter(folderA)
+        model.enter(nested)
+        model.playlists = [top]
+        model.reconcileFolderPath()
+        assert(model.currentFolder == nil && model.visibleEntries.map(\PlaylistInfo.id) == ["P3"])
+        print("PASS: playlist folders browse and survive disappearing")
+
         // A duration that is not a usable number must not reach the UI: it ends
         // up as the upper bound of the progress slider's range.
         let GS2 = "\u{1D}", RS2 = "\u{1E}"

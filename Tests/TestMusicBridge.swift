@@ -91,6 +91,10 @@ enum MusicBridge {
         shuffleWrites.append(value)
         snapshot.shuffle = value
     }
+    static var stubPlaylists: [PlaylistInfo] = []
+    static var stubTracks: [String: [MusicTrack]] = [:]
+    static func playlists() throws -> [PlaylistInfo] { stubPlaylists }
+    static func tracks(inPlaylist id: String) throws -> [MusicTrack] { stubTracks[id] ?? [] }
     static func nativeNext() throws { nativeNextCount += 1 }
     static func nativePrev() throws {}
 }

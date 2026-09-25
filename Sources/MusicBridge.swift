@@ -305,14 +305,37 @@ enum MusicBridge {
     }
 
     static func playlists() throws -> [PlaylistInfo] {
+        // Folders are kept, not filtered out, and each entry carries the folder
+        // it belongs to so the panel can show the structure the user built.
+        // `parent` has to be asked for one playlist at a time — it errors for
+        // anything at the top level — but there are only a couple of dozen.
         let src = joinHandler + """
         tell application id "com.apple.Music"
             set mqOut to {}
+            -- Folders are their own class and do NOT appear in `every user
+            -- playlist`; they surface only as someone's parent. Enumerate them
+            -- separately or the structure is invisible.
+            repeat with mqFolder in (every folder playlist)
+                try
+                    set mqParent to ""
+                    try
+                        set mqParent to (persistent ID of (parent of mqFolder))
+                    end try
+                    set end of mqOut to my joinList({(persistent ID of mqFolder), (name of mqFolder), "0", mqParent, "1"})
+                end try
+            end repeat
             repeat with mqPL in (every user playlist)
                 try
-                    if (class of mqPL) is not folder playlist then
-                        set end of mqOut to my joinList({(persistent ID of mqPL), (name of mqPL), ((count of tracks of mqPL) as text)})
-                    end if
+                    set mqIsFolder to "0"
+                    set mqCount to "0"
+                    try
+                        set mqCount to ((count of tracks of mqPL) as text)
+                    end try
+                    set mqParent to ""
+                    try
+                        set mqParent to (persistent ID of (parent of mqPL))
+                    end try
+                    set end of mqOut to my joinList({(persistent ID of mqPL), (name of mqPL), mqCount, mqParent, mqIsFolder})
                 end try
             end repeat
         end tell
@@ -322,7 +345,9 @@ enum MusicBridge {
         return raw.split(separator: "\u{1D}").compactMap { line in
             let f = String(line).components(separatedBy: RS)
             guard f.count >= 3 else { return nil }
-            return PlaylistInfo(id: f[0], name: f[1], count: Int(f[2]) ?? 0)
+            return PlaylistInfo(id: f[0], name: f[1], count: Int(f[2]) ?? 0,
+                                parentID: f.count > 3 && !f[3].isEmpty ? f[3] : nil,
+                                isFolder: f.count > 4 && f[4] == "1")
         }
     }
 
