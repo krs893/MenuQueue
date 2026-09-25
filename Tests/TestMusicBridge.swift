@@ -62,6 +62,11 @@ enum MusicBridge {
         return captured
     }
     static func artworkOfCurrentTrack() -> NSImage? { nil }
+    static var artworkRequests: [Int] = []
+    static func artwork(databaseID: Int, playlistID: String?) -> NSImage? {
+        artworkRequests.append(databaseID)
+        return nil
+    }
     static func setRepeat(_ mode: String) throws { repeatWrites.append(mode); snapshot.repeatMode = mode }
     static func play(databaseID: Int, playlistID: String? = nil) throws -> Bool {
         Thread.sleep(forTimeInterval: delay)

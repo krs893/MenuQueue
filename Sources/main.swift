@@ -23,33 +23,94 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var playerWindow: NSWindow?
     private var cancellables = Set<AnyCancellable>()
 
-    /// Menu bar space is shared with every other app, so the title is capped
-    /// and the artist is dropped before the track name is.
-    private static let titleLimit = 34
+    /// Menu bar space is shared with every other app — the user wants room for
+    /// other status items — so the width is a constant and long titles scroll
+    /// through it. Only the track name goes up there; artist and album stay in
+    /// the tooltip and in the panel.
+    /// Characters visible at once. Deliberately small: every point taken here
+    /// is a point unavailable to the other status items sharing the menu bar.
+    /// Override with `defaults write jp.local.menuqueue menuBarTitleWidth -int N`.
+    private static var titleWidth: Int {
+        let configured = UserDefaults.standard.integer(forKey: "menuBarTitleWidth")
+        return configured > 0 ? min(configured, 40) : 10
+    }
+    private static let titleFont = NSFont.systemFont(ofSize: 12)
+    private static let scrollInterval: TimeInterval = 0.28
+
+    /// Reserve exactly what the window needs rather than guessing a constant:
+    /// measured against full-width glyphs so a Japanese title fits, and only
+    /// while something is actually scrolling.
+    private static var scrollingItemWidth: CGFloat {
+        let sample = " " + String(repeating: "あ", count: titleWidth)
+        let measured = (sample as NSString).size(withAttributes: [.font: titleFont]).width
+        // Room for the icon and the button's own padding.
+        return ceil(measured) + 30
+    }
+
+    private var marqueeTimer: Timer?
+    private var marqueeStep = 0
+    private var marqueeText = ""
+    private var marqueeIsPlaying = false
+
+    private func setMarquee(text: String, playing: Bool) {
+        if text != marqueeText {
+            marqueeText = text
+            marqueeStep = 0
+        }
+        marqueeIsPlaying = playing
+        let needsScroll = playing && Marquee.scrolls(text, width: Self.titleWidth)
+        if needsScroll {
+            if marqueeTimer == nil {
+                let timer = Timer(timeInterval: Self.scrollInterval, repeats: true) { [weak self] _ in
+                    Task { @MainActor in self?.advanceMarquee() }
+                }
+                // Common mode so the ticker keeps moving while a menu is open.
+                RunLoop.main.add(timer, forMode: .common)
+                marqueeTimer = timer
+            }
+        } else {
+            marqueeTimer?.invalidate()
+            marqueeTimer = nil
+        }
+        renderMarquee()
+    }
+
+    private func advanceMarquee() {
+        marqueeStep += 1
+        renderMarquee()
+    }
+
+    private func renderMarquee() {
+        guard let button = statusItem?.button else { return }
+        let scrolling = marqueeIsPlaying && Marquee.scrolls(marqueeText, width: Self.titleWidth)
+        let visible = scrolling
+            ? Marquee.window(marqueeText, width: Self.titleWidth, step: marqueeStep)
+            : Marquee.parked(marqueeText, width: Self.titleWidth)
+        // A title that fits takes only the space it needs; a scrolling one gets
+        // a fixed width so the items beside it do not shuffle on every frame.
+        statusItem.length = scrolling ? Self.scrollingItemWidth : NSStatusItem.variableLength
+        button.attributedTitle = NSAttributedString(string: " " + visible, attributes: [
+            .font: Self.titleFont,
+            .foregroundColor: marqueeIsPlaying ? NSColor.labelColor : NSColor.secondaryLabelColor
+        ])
+    }
 
     private func updateStatusTitle(_ snapshot: NowPlaying) {
         guard let button = statusItem?.button else { return }
         guard let track = snapshot.track, snapshot.state != .stopped else {
+            marqueeTimer?.invalidate()
+            marqueeTimer = nil
+            marqueeText = ""
             button.attributedTitle = NSAttributedString(string: "")
             button.imagePosition = .imageOnly
+            statusItem.length = NSStatusItem.squareLength
             button.toolTip = "MenuQueue"
             return
         }
 
-        var label = track.name
-        if !track.artist.isEmpty, label.count + track.artist.count + 3 <= Self.titleLimit {
-            label += " — " + track.artist
-        }
-        if label.count > Self.titleLimit {
-            label = String(label.prefix(Self.titleLimit - 1)) + "…"
-        }
-
         button.imagePosition = .imageLeading
-        button.attributedTitle = NSAttributedString(string: " " + label, attributes: [
-            .font: NSFont.systemFont(ofSize: 12),
-            // A paused track stays readable but recedes.
-            .foregroundColor: snapshot.state.isPlaying ? NSColor.labelColor : NSColor.secondaryLabelColor
-        ])
+        // A paused track stays readable but recedes, and stops scrolling.
+        setMarquee(text: track.name, playing: snapshot.state.isPlaying)
         button.toolTip = [track.name, track.artist, track.album]
             .filter { !$0.isEmpty }.joined(separator: " — ")
     }
@@ -100,6 +161,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        marqueeTimer?.invalidate()
+        marqueeTimer = nil
         dismissPanel()
         NotificationCenter.default.removeObserver(self)
         player?.shutdown()

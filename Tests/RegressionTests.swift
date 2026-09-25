@@ -1,4 +1,5 @@
 import Foundation
+import AppKit
 
 @main
 struct RegressionTests {
@@ -145,6 +146,62 @@ struct RegressionTests {
         let lone = try index.search("lone").count
         assert(lone == 1, "a missing date column must not drop the playlist")
         print("PASS: recently added first, undated tracks keep a stable order")
+
+        // The menu bar ticker: a short title must sit still, a long one has to
+        // loop cleanly, and the item width has to stay constant either way.
+        assert(!Marquee.scrolls("短い", width: 14))
+        assert(Marquee.window("短い", width: 14, step: 99) == "短い", "a short title never moves")
+        assert(Marquee.parked("短い", width: 14) == "短い")
+
+        let long = "とても長い曲名がここにあって収まらない"
+        assert(Marquee.scrolls(long, width: 8))
+        let first = Marquee.window(long, width: 8, step: 0)
+        assert(first.count == 8 && first == String(long.prefix(8)))
+        // Every step keeps the same width, including across the wrap.
+        for step in 0..<200 {
+            assert(Marquee.window(long, width: 8, step: step).count == 8,
+                   "width drifted at step \(step)")
+        }
+        // One full loop is text + gap, and it returns to where it started.
+        let period = long.count + Marquee.gap.count
+        assert(Marquee.window(long, width: 8, step: period) == first, "the loop must close")
+        assert(Marquee.window(long, width: 8, step: -1) == Marquee.window(long, width: 8, step: period - 1),
+               "a negative step must not index out of the loop")
+        // Parked titles show the head, not the middle of a scroll.
+        assert(Marquee.parked(long, width: 8) == String(long.prefix(7)) + "…")
+        assert(Marquee.window("", width: 8, step: 3).isEmpty)
+        assert(Marquee.window(long, width: 0, step: 3).isEmpty)
+        assert(!Marquee.scrolls(long, width: 0))
+        print("PASS: the menu bar ticker keeps a constant width and loops cleanly")
+
+        // Album art is cached per album, not per track: a playlist of 271 songs
+        // spanned 84 albums here, so keying by track would fetch three times
+        // over for no benefit.
+        let a1 = MusicTrack(databaseID: 1, name: "one", artist: "Band", album: "Record", duration: 1)
+        let a2 = MusicTrack(databaseID: 2, name: "two", artist: "Band", album: "Record", duration: 1)
+        let a3 = MusicTrack(databaseID: 3, name: "three", artist: "Band", album: "Other", duration: 1)
+        assert(ArtworkStore.key(a1) == ArtworkStore.key(a2), "same album shares one fetch")
+        assert(ArtworkStore.key(a1) != ArtworkStore.key(a3))
+        // Case and padding in the metadata must not split the cache.
+        let a4 = MusicTrack(databaseID: 4, name: "four", artist: "BAND", album: " Record ", duration: 1)
+        assert(ArtworkStore.key(a1) == ArtworkStore.key(a4))
+        // A track with no album falls back to its own id rather than sharing a
+        // blank key with every other album-less track.
+        let b1 = MusicTrack(databaseID: 5, name: "x", artist: "Band", album: "", duration: 1)
+        let b2 = MusicTrack(databaseID: 6, name: "y", artist: "Band", album: "   ", duration: 1)
+        assert(ArtworkStore.key(b1) != ArtworkStore.key(b2))
+
+        // Music hands back full size covers; what gets cached has to be small.
+        let big = NSImage(size: NSSize(width: 1200, height: 900))
+        big.lockFocus()
+        NSColor.systemTeal.setFill()
+        NSRect(x: 0, y: 0, width: 1200, height: 900).fill()
+        big.unlockFocus()
+        let thumb = ArtworkStore.downscale(big, to: ArtworkStore.side)
+        assert(thumb != nil)
+        assert(thumb!.size == NSSize(width: ArtworkStore.side, height: ArtworkStore.side),
+               "a non-square cover must come out square, not stretched")
+        print("PASS: album art is cached per album and stored as a thumbnail")
 
         // A duration that is not a usable number must not reach the UI: it ends
         // up as the upper bound of the progress slider's range.

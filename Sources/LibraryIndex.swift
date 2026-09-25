@@ -3,6 +3,12 @@ import Foundation
 /// An in-memory snapshot of every user playlist's tracks, fetched in one
 /// AppleScript round trip.
 ///
+/// **Currently unused.** It existed to answer library searches, and the search
+/// field is no longer part of the panel. Nothing loads it, so it costs nothing
+/// at runtime; it is kept because the awkward parts — cloud tracks, empty
+/// playlists, undated tracks — are already solved and tested here, and are
+/// easy to get wrong again.
+///
 /// Why this exists instead of `search library playlist 1`:
 ///
 /// With an iCloud / Apple Music library, playlist entries are `shared track`s

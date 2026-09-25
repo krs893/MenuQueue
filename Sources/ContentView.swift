@@ -211,6 +211,7 @@ struct TransportBar: View {
 struct LibraryTab: View {
     @ObservedObject var library: LibraryModel
     @ObservedObject var player: PlayerController
+    @StateObject private var artwork = ArtworkStore()
     private let controlSize: CGFloat = 34
 
     var body: some View {
@@ -241,8 +242,7 @@ struct LibraryTab: View {
                 }
                 .help("ライブラリを読み直す")
                 .accessibilityLabel("ライブラリを読み直す")
-                .help("再読み込み").accessibilityLabel("再読み込み")
-                .disabled(library.isLoadingPlaylists || library.isLoadingTracks || player.addingPlaylistID != nil)
+                .disabled(library.isLoadingPlaylists || library.isLoadingTracks)
             }
             .buttonStyle(.borderless)
             .fixedSize(horizontal: false, vertical: true)
@@ -262,7 +262,9 @@ struct LibraryTab: View {
                           text: library.isLoadingTracks ? "読み込み中…" : "このプレイリストは空です")
             } else {
                 List(library.playlistTracks) { track in
-                    TrackPickRow(track: track, play: { Task { await player.playNative(track) } })
+                    TrackPickRow(track: track,
+                                 play: { Task { await player.playNative(track) } },
+                                 artwork: artwork)
                 }
                 .listStyle(.plain)
             }
@@ -284,13 +286,36 @@ struct LibraryTab: View {
     }
 }
 
+/// A square of album art, or a placeholder of the same size so rows do not
+/// shift as pictures arrive.
+struct ArtworkThumbnail: View {
+    let image: NSImage?
+
+    var body: some View {
+        ZStack {
+            RoundedRectangle(cornerRadius: 4).fill(.quaternary)
+            if let image {
+                Image(nsImage: image).resizable().aspectRatio(contentMode: .fill)
+            } else {
+                Image(systemName: "music.note")
+                    .font(.system(size: 13))
+                    .foregroundStyle(.tertiary)
+            }
+        }
+        .frame(width: ArtworkStore.side, height: ArtworkStore.side)
+        .clipShape(RoundedRectangle(cornerRadius: 4))
+    }
+}
+
 struct TrackPickRow: View {
     let track: MusicTrack
     let play: () -> Void
+    @ObservedObject var artwork: ArtworkStore
 
     var body: some View {
         Button(action: play) {
             HStack(spacing: 10) {
+                ArtworkThumbnail(image: artwork.thumbnail(for: track))
                 VStack(alignment: .leading, spacing: 3) {
                     Text(track.name).font(.system(size: 14)).lineLimit(1)
                     Text(track.subtitle).font(.system(size: 12)).foregroundStyle(.secondary).lineLimit(1)
@@ -302,6 +327,9 @@ struct TrackPickRow: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
+        // Rows fetch their own art as they scroll into view, so a long
+        // playlist only pays for what is on screen.
+        .task(id: ArtworkStore.key(track)) { await artwork.load(track) }
         .help("再生").accessibilityLabel("\(track.name)を再生")
     }
 

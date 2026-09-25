@@ -132,6 +132,31 @@ enum MusicBridge {
         return np
     }
 
+    /// Artwork for a specific library track. Resolved the same way playback is:
+    /// cloud tracks only exist inside their own playlist, never in the library
+    /// playlist, so the container has to come with the id.
+    static func artwork(databaseID: Int, playlistID: String?) -> NSImage? {
+        let pid = esc(playlistID ?? "")
+        let container = playlistID == nil
+            ? "library playlist 1"
+            : "(first user playlist whose persistent ID is \"\(pid)\")"
+        let src = """
+        tell application id "com.apple.Music"
+            try
+                set mqMatches to (every track of \(container) whose database ID is \(databaseID))
+                if mqMatches is {} then return missing value
+                return raw data of artwork 1 of (item 1 of mqMatches)
+            on error
+                return missing value
+            end try
+        end tell
+        """
+        guard let desc = try? ScriptRunner.shared.run(src) else { return nil }
+        let data = desc.data
+        guard data.count > 16 else { return nil }
+        return NSImage(data: data)
+    }
+
     static func artworkOfCurrentTrack() -> NSImage? {
         guard isRunning else { return nil }
         let src = """
