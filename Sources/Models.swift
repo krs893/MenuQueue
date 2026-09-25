@@ -10,6 +10,10 @@ struct MusicTrack: Codable, Hashable, Identifiable {
     var album: String
     var duration: Double
     var sourcePlaylistID: String? = nil
+    /// Seconds since the epoch, as Music reports "date added". Only the
+    /// ordering matters, so the timezone offset baked into it is harmless —
+    /// it is the same constant for every track.
+    var addedAt: Double = 0
 
     var subtitle: String {
         [artist, album].filter { !$0.isEmpty }.joined(separator: " — ")
@@ -39,6 +43,7 @@ struct NowPlaying {
     var shuffle: Bool = false
     var repeatMode: String = "off"
     var volume: Int = 100
+    var muted: Bool = false
 }
 
 

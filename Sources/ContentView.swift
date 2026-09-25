@@ -8,24 +8,10 @@ func timeString(_ seconds: Double) -> String {
     return String(format: "%d:%02d", total / 60, total % 60)
 }
 
-enum Tab: String, CaseIterable, Identifiable {
-    case queue = "キュー"
-    case playlists = "プレイリスト"
-    var id: String { rawValue }
-    var icon: String {
-        switch self {
-        case .queue: return "list.bullet"
-        case .playlists: return "music.note.list"
-        }
-    }
-}
-
 struct ContentView: View {
     @ObservedObject var player: PlayerController
     @ObservedObject var store: QueueStore
     @StateObject private var library = LibraryModel()
-    @StateObject private var upNext = UpNextModel()
-    @State private var tab: Tab = .queue
     @State private var showSettings = false
 
     var body: some View {
@@ -39,23 +25,12 @@ struct ContentView: View {
             if showSettings {
                 SettingsPanel(player: player, store: store, close: { showSettings = false })
             } else {
-                Picker("", selection: $tab) {
-                    ForEach(Tab.allCases) { Image(systemName: $0.icon).help($0.rawValue).accessibilityLabel($0.rawValue).tag($0) }
-                }
-                .pickerStyle(.segmented)
-                .labelsHidden()
-                .padding(.horizontal, 10)
-                .padding(.vertical, 8)
-
-                Group {
-                    switch tab {
-                    case .queue: UpNextTab(model: upNext)
-                        .task(id: "\(player.now.track?.databaseID ?? 0):\(player.queueRevision)") { upNext.refresh(openIfNeeded: true) }
-                    case .playlists: LibraryTab(library: library, player: player)
-
-                    }
-                }
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                // Reading Music's queue needs Accessibility and adding to it is
+                // not possible on this macOS at all, so the panel is now just
+                // what is playing, the controls, and a way to start something.
+                LibraryTab(library: library, player: player)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .padding(.top, 8)
             }
 
             if let err = player.lastError {
@@ -66,12 +41,9 @@ struct ContentView: View {
                 }.padding(.horizontal, 12).padding(.bottom, 6)
             }
         }
-        .frame(minWidth: 360, minHeight: 480, maxHeight: .infinity)
+        .frame(minWidth: 360, minHeight: 420, maxHeight: .infinity)
         .onAppear {
             library.loadPlaylists()
-        }
-        .onChange(of: tab) { _, newValue in
-            if newValue == .playlists { library.loadPlaylists() }
         }
     }
 }
@@ -163,6 +135,16 @@ struct NowPlayingHeader: View {
 struct TransportBar: View {
     @ObservedObject var player: PlayerController
 
+    private var muteSymbol: String {
+        if player.isMuted { return "speaker.slash.fill" }
+        switch player.now.volume {
+        case 0: return "speaker.fill"
+        case 1..<34: return "speaker.wave.1.fill"
+        case 34..<67: return "speaker.wave.2.fill"
+        default: return "speaker.wave.3.fill"
+        }
+    }
+
     var body: some View {
         HStack(spacing: 18) {
             Button { player.toggleShuffle() } label: {
@@ -182,7 +164,10 @@ struct TransportBar: View {
             Button { player.togglePlayPause() } label: {
                 Image(systemName: player.now.state.isPlaying ? "pause.circle.fill" : "play.circle.fill")
                     .font(.system(size: 36))
+                    .foregroundStyle(player.canStartPlayback ? AnyShapeStyle(.primary) : AnyShapeStyle(.tertiary))
             }
+            .disabled(!player.canStartPlayback)
+            .help(player.playbackUnavailableReason ?? (player.now.state.isPlaying ? "一時停止" : "再生"))
             Button { player.next() } label: {
                 ZStack {
                     Image(systemName: "forward.fill").opacity(player.pendingSkipCount > 0 ? 0.35 : 1)
@@ -198,13 +183,21 @@ struct TransportBar: View {
 
             Spacer(minLength: 4)
 
-            Image(systemName: "speaker.fill").font(.system(size: 9)).foregroundStyle(.secondary)
+            Button { player.toggleMute() } label: {
+                Image(systemName: muteSymbol)
+                    .font(.system(size: 11))
+                    .frame(width: 18)
+                    .foregroundStyle(player.isMuted ? AnyShapeStyle(.tint) : AnyShapeStyle(.secondary))
+            }
+            .help(player.isMuted ? "ミュート解除" : "ミュート")
+            .accessibilityLabel(player.isMuted ? "ミュート解除" : "ミュート")
+
             Slider(value: Binding(
                 get: { Double(player.now.volume) },
                 set: { player.setVolume(Int($0)) }
             ), in: 0...100)
             .controlSize(.mini)
-            .frame(width: 70)
+            .frame(width: 64)
         }
         .buttonStyle(.plain)
         .font(.system(size: 14))
@@ -214,50 +207,6 @@ struct TransportBar: View {
 }
 
 // MARK: - Current Music queue
-
-struct UpNextTab: View {
-    @ObservedObject var model: UpNextModel
-
-    var body: some View {
-        VStack(spacing: 0) {
-            HStack {
-                Image(systemName: "eye").foregroundStyle(.secondary).help("Music側のキュー・読み取り専用")
-                Spacer()
-                if model.loading { ProgressView().controlSize(.small) }
-                Button { model.refresh(openIfNeeded: true) } label: { Image(systemName: "arrow.clockwise") }
-                    .buttonStyle(.borderless)
-                    .disabled(model.loading)
-            }
-            .padding(.horizontal, 10).padding(.bottom, 6)
-
-            if let err = model.error {
-                VStack(spacing: 16) {
-                    Image(systemName: "exclamationmark.triangle")
-                        .font(.largeTitle).foregroundStyle(.secondary).help(err)
-                    if !UpNextReader.isTrusted {
-                        Button { UpNextReader.requestTrust() } label: {
-                            Image(systemName: "lock.open").font(.title2)
-                        }.help("アクセシビリティを許可する")
-                    }
-                }.frame(maxWidth: .infinity, maxHeight: .infinity)
-            } else if model.rows.isEmpty {
-                EmptyHint(icon: "list.bullet.indent", text: "「更新」で Music.app の\n次に再生リストを読み込みます。")
-            } else {
-                List(model.rows) { row in
-                    VStack(alignment: .leading, spacing: 1) {
-                        Text(row.title).font(.system(size: 14)).lineLimit(1)
-                        if !row.subtitle.isEmpty {
-                            Text(row.subtitle).font(.system(size: 12)).foregroundStyle(.secondary).lineLimit(1)
-                        }
-                    }
-                }
-                .listStyle(.plain)
-            }
-        }
-    }
-}
-
-// MARK: - Add
 
 struct LibraryTab: View {
     @ObservedObject var library: LibraryModel
@@ -273,32 +222,25 @@ struct LibraryTab: View {
                     }.help("戻る")
                     Text(selected.name).font(.subheadline).bold().lineLimit(1)
                         .frame(maxWidth: .infinity, alignment: .leading).layoutPriority(-1)
-                    Button {
-                        Task { await player.enqueueNativePlaylist(selected.id) }
-                    } label: {
-                        Group {
-                            if player.addingPlaylistID == selected.id { ProgressView().controlSize(.small) }
-                            else { Image(systemName: player.lastAddedPlaylistID == selected.id ? "checkmark" : "text.badge.plus") }
-                        }.frame(width: controlSize, height: controlSize)
-                    }
-                    .help(player.lastAddedPlaylistID == selected.id ? "全曲を追加しました" : "全曲をキューに追加")
-                    .accessibilityLabel("全曲をキューに追加")
-                    .disabled(library.playlistTracks.isEmpty || player.addingPlaylistID != nil)
+                    // "Add to queue" is gone: it drove Music's toolbar menu
+                    // through Accessibility, and on macOS 26 that toolbar
+                    // exposes no children at all, so it never added anything.
                     Button {
                         Task { await player.playNativePlaylist(selected.id) }
                     } label: { Image(systemName: "play.fill").frame(width: controlSize, height: controlSize) }
                     .help("プレイリストを再生").accessibilityLabel("プレイリストを再生")
-                    .disabled(library.playlistTracks.isEmpty || player.addingPlaylistID != nil)
+                    .disabled(library.playlistTracks.isEmpty)
                 } else { Spacer() }
                 Button {
-                    if let selected = library.selectedPlaylist { library.loadTracks(of: selected) }
-                    else { library.loadPlaylists() }
+                    library.reloadEverything()
                 } label: {
                     Group {
                         if library.isLoadingPlaylists || library.isLoadingTracks { ProgressView().controlSize(.small) }
                         else { Image(systemName: "arrow.clockwise") }
                     }.frame(width: controlSize, height: controlSize)
                 }
+                .help("ライブラリを読み直す")
+                .accessibilityLabel("ライブラリを読み直す")
                 .help("再読み込み").accessibilityLabel("再読み込み")
                 .disabled(library.isLoadingPlaylists || library.isLoadingTracks || player.addingPlaylistID != nil)
             }
@@ -401,17 +343,6 @@ struct SettingsPanel: View {
                 }
                 if let error = loginItemError {
                     Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange).help(error)
-                }
-                Divider()
-                HStack {
-                    Image(systemName: UpNextReader.isTrusted ? "lock.open.fill" : "lock.fill")
-                        .foregroundStyle(UpNextReader.isTrusted ? .green : .orange)
-                        .frame(width: 28).help("アクセシビリティ")
-                    Spacer()
-                    if !UpNextReader.isTrusted {
-                        Button { UpNextReader.requestTrust() } label: { Image(systemName: "key") }
-                            .help("アクセシビリティの許可をリクエスト")
-                    }
                 }
                 Divider()
                 HStack {

@@ -16,6 +16,19 @@ final class TestSignal {
     }
 }
 
+// LibraryIndex drives AppleScript directly rather than through MusicBridge,
+// so it needs its own stub: the regression run must never read the real
+// library or depend on what happens to be in it.
+final class ScriptRunner {
+    static let shared = ScriptRunner()
+    static var canned = ""
+    static var calls = 0
+    func string(_ source: String) throws -> String {
+        Self.calls += 1
+        return Self.canned
+    }
+}
+
 enum MusicBridge {
     static let bundleID = "com.apple.Music"
     static var isRunning = true
@@ -62,7 +75,8 @@ enum MusicBridge {
     static func pause() throws { snapshot.state = .paused }
     static func playPause() throws { snapshot.state = snapshot.state.isPlaying ? .paused : .playing }
     static func seek(to value: Double) throws { snapshot.position = value }
-    static func setVolume(_ value: Int) throws { snapshot.volume = value }
+    static func setVolume(_ value: Int) throws { volumeWrites.append(value); snapshot.volume = value }
+    static var volumeWrites: [Int] = []
     static func setShuffle(_ value: Bool) throws {
         let wait = shuffleDelay
         let fail = failShuffle

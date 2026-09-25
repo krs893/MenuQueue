@@ -25,9 +25,21 @@ final class LibraryModel: ObservableObject {
         searchTask = Task { [weak self] in
             try? await Task.sleep(nanoseconds: 300_000_000)
             guard !Task.isCancelled, let self else { return }
-            let outcome = await Task.detached(priority: .userInitiated) {
-                Result { try MusicBridge.search(q) }
+            // Music's own search verb only covers locally stored tracks, which
+            // for an Apple Music library is a small minority. See LibraryIndex.
+            var outcome = await Task.detached(priority: .userInitiated) {
+                Result { try LibraryIndex.shared.search(q) }
             }.value
+            // Nothing found may just mean the snapshot predates the song the
+            // user has only just added. Re-read once before saying "no hits",
+            // otherwise a new track stays invisible until the cache ages out.
+            if case .success(let hits) = outcome, hits.isEmpty,
+               !LibraryIndex.shared.isFresh(within: 10) {
+                outcome = await Task.detached(priority: .userInitiated) {
+                    LibraryIndex.shared.invalidate()
+                    return Result { try LibraryIndex.shared.search(q) }
+                }.value
+            }
             guard !Task.isCancelled else { return }
             self.isSearching = false
             switch outcome {
@@ -39,7 +51,18 @@ final class LibraryModel: ObservableObject {
         }
     }
 
+    /// Explicit refresh: drop the library snapshot as well, so newly added
+    /// songs show up in search and the playlist counts are recomputed.
+    func reloadEverything() {
+        LibraryIndex.shared.invalidate()
+        loadPlaylists()
+        if let selected = selectedPlaylist { loadTracks(of: selected) }
+    }
+
     func loadPlaylists() {
+        // Pay the one-second index load in the background while the user is
+        // still looking at the queue, not on their first keystroke.
+        LibraryIndex.shared.warm()
         guard !isLoadingPlaylists else { return }
         isLoadingPlaylists = true
         playlistError = nil
@@ -51,7 +74,20 @@ final class LibraryModel: ObservableObject {
             self.isLoadingPlaylists = false
             switch outcome {
             case .success(let lists):
-                self.playlists = lists.sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
+                let counts = LibraryIndex.shared.playlistCounts()
+                self.playlists = lists
+                    .map { pl in
+                        // Once the index is warm its counts are free and cover
+                        // cloud tracks that `count of tracks` can miss.
+                        guard let n = counts[pl.id], n != pl.count else { return pl }
+                        var copy = pl
+                        copy.count = n
+                        return copy
+                    }
+                // Music exposes no date for a playlist, so there is no
+                // "date added" to sort by. Its own order is the closest thing
+                // and matches what the sidebar shows; alphabetising was ours.
+
             case .failure(let error): self.playlistError = error.localizedDescription
             }
         }
@@ -74,45 +110,6 @@ final class LibraryModel: ObservableObject {
             switch outcome {
             case .success(let tracks): self.playlistTracks = tracks
             case .failure(let error): self.playlistError = error.localizedDescription
-            }
-        }
-    }
-}
-
-/// Up Next scraping, kept separate so a failure never blocks the queue tab.
-@MainActor
-final class UpNextModel: ObservableObject {
-    @Published var rows: [UpNextRow] = []
-    @Published var error: String?
-    @Published var loading = false
-    @Published var lastRead: Date?
-
-    // Warm an already visible Music queue without changing Music's UI.
-    // Opening MenuQueue explicitly requests a fresh read as well.
-    init() { refresh() }
-
-    func refresh(openIfNeeded: Bool = false) {
-        guard !loading else { return }
-        loading = true
-        error = nil
-        Task { [weak self] in
-            let outcome: Result<[UpNextRow], Error> = await Task.detached(priority: .userInitiated) {
-                do { return .success(try UpNextReader.read(openIfNeeded: openIfNeeded)) }
-                catch { return .failure(error) }
-            }.value
-            guard let self else { return }
-            self.loading = false
-            switch outcome {
-            case .success(let rows):
-                self.rows = rows
-                self.lastRead = Date()
-                UserDefaults.standard.set("success: \(rows.count) rows", forKey: "queueReadStatus")
-                UserDefaults.standard.set(Date(), forKey: "queueReadDate")
-            case .failure(let err):
-                self.rows = []
-                self.error = (err as? LocalizedError)?.errorDescription ?? "\(err)"
-                UserDefaults.standard.set(self.error, forKey: "queueReadStatus")
-                UserDefaults.standard.set(Date(), forKey: "queueReadDate")
             }
         }
     }

@@ -47,6 +47,18 @@ final class PlayerController: ObservableObject {
 
     private var expectedDBID: Int?
     private var savedRepeat: String?
+    /// Mirrors `savedRepeat` on disk. Borrowing Music's repeat mode is a change
+    /// to someone else's app, and the in-memory copy dies with the process: if
+    /// Music quits mid-queue, or this app is force quit, nothing is left to
+    /// hand the setting back and the user is stuck on repeat-one for good.
+    private static let borrowedRepeatKey = "borrowedRepeatMode"
+    private var pendingRepeatRestore: String? {
+        get { UserDefaults.standard.string(forKey: Self.borrowedRepeatKey) }
+        set {
+            if let newValue { UserDefaults.standard.set(newValue, forKey: Self.borrowedRepeatKey) }
+            else { UserDefaults.standard.removeObject(forKey: Self.borrowedRepeatKey) }
+        }
+    }
     private var lastPosition: Double = 0
     private var advancing = false
     private var transitioning = false
@@ -90,8 +102,9 @@ final class PlayerController: ObservableObject {
         shuffleTask?.cancel()
         if let observer { DistributedNotificationCenter.default().removeObserver(observer) }
         // Termination must not leave an unawaited task restoring repeat after exit.
-        if let saved = savedRepeat, MusicBridge.isRunning {
+        if let saved = savedRepeat ?? pendingRepeatRestore, MusicBridge.isRunning {
             try? MusicBridge.setRepeat(saved)
+            pendingRepeatRestore = nil
         }
     }
 
@@ -120,6 +133,8 @@ final class PlayerController: ObservableObject {
             pollInterval = 3.0
             owns = false
             expectedDBID = nil
+            // Only the in-memory copy goes; pendingRepeatRestore survives so
+            // the borrowed mode is returned once Music comes back.
             savedRepeat = nil
             return
         }
@@ -130,6 +145,11 @@ final class PlayerController: ObservableObject {
         }
 
         guard snapshotRevision == revision, !transitioning else { return }
+        // Music is back (or this is a fresh launch) and we are not driving it:
+        // give back anything a previous session borrowed and never returned.
+        if !owns, savedRepeat == nil, pendingRepeatRestore != nil {
+            await restoreRepeat()
+        }
         let previousState = now.state
         now = np
 
@@ -264,15 +284,22 @@ final class PlayerController: ObservableObject {
         guard gaplessTakeover else { return }
         if savedRepeat == nil {
             guard let current = await bridge({ try MusicBridge.nowPlaying() }) else { return }
-            savedRepeat = current.repeatMode
+            // Never record "one" as the mode to go back to: that is the mode
+            // being borrowed, and a leftover entry from an earlier crash would
+            // otherwise make it permanent.
+            savedRepeat = current.repeatMode == "one" ? (pendingRepeatRestore ?? "off") : current.repeatMode
+            pendingRepeatRestore = savedRepeat
         }
         _ = await bridge({ try MusicBridge.setRepeat("one") })
     }
 
     private func restoreRepeat() async {
-        guard let saved = savedRepeat else { return }
+        guard let saved = savedRepeat ?? pendingRepeatRestore else { return }
         let restored: Void? = await bridge({ try MusicBridge.setRepeat(saved) })
-        if restored != nil { savedRepeat = nil }
+        if restored != nil {
+            savedRepeat = nil
+            pendingRepeatRestore = nil
+        }
     }
 
     // Search and playlists operate on Music's actual queue.
@@ -318,10 +345,31 @@ final class PlayerController: ObservableObject {
 
     // MARK: - Transport exposed to the UI
 
+    /// Music reports `stopped` with no current track when its queue has run
+    /// out or been cleared. Its own Play menu item is disabled in that state,
+    /// so `play` and `playpause` do nothing at all — the button looked broken.
+    /// Fall back to this app's queue when it has something, and otherwise say
+    /// there is nothing to play rather than swallowing the click.
+    var canStartPlayback: Bool {
+        guard musicRunning else { return false }
+        if now.track != nil { return true }
+        return !store.items.isEmpty
+    }
+
+    var playbackUnavailableReason: String? {
+        guard musicRunning else { return "ミュージックが起動していません" }
+        guard now.track == nil, store.items.isEmpty else { return nil }
+        return "Musicに再生中の曲がありません。ライブラリタブからプレイリストを再生してください"
+    }
+
     func togglePlayPause() {
         Task {
             guard !transitioning, !advancing else { return }
-            _ = await bridge({ try MusicBridge.playPause() })
+            if now.track == nil, !store.items.isEmpty {
+                await startQueueFromTop()
+            } else {
+                _ = await bridge({ try MusicBridge.playPause() })
+            }
             await tick()
         }
     }
@@ -372,8 +420,44 @@ final class PlayerController: ObservableObject {
         Task { _ = await bridge({ try MusicBridge.seek(to: seconds) }) }
     }
 
+    /// Music's `mute` property is read-only through AppleScript — writing it
+    /// fails with error 9038 — so muting means dropping the volume to zero and
+    /// remembering what it was. The remembered level is persisted: being left
+    /// silent with no way back after a restart would be worse than the extra
+    /// state.
+    private static let mutedVolumeKey = "mutedVolume"
+    private var storedMuteLevel: Int? {
+        get {
+            guard UserDefaults.standard.object(forKey: Self.mutedVolumeKey) != nil else { return nil }
+            return UserDefaults.standard.integer(forKey: Self.mutedVolumeKey)
+        }
+        set {
+            if let newValue { UserDefaults.standard.set(newValue, forKey: Self.mutedVolumeKey) }
+            else { UserDefaults.standard.removeObject(forKey: Self.mutedVolumeKey) }
+        }
+    }
+
+    /// True when this app silenced Music, or when Music reports itself muted.
+    var isMuted: Bool { storedMuteLevel != nil || now.muted }
+
+    func toggleMute() {
+        if let level = storedMuteLevel {
+            storedMuteLevel = nil
+            setVolume(level == 0 ? 25 : level)
+            return
+        }
+        // Nothing to come back to if it is already silent; use a sensible level.
+        let level = now.volume > 0 ? now.volume : 25
+        storedMuteLevel = level
+        setVolume(0)
+    }
+
     func setVolume(_ v: Int) {
+        // Moving the slider is an explicit volume choice, so it cancels a mute
+        // rather than leaving a stale level to be restored later.
+        if v > 0, storedMuteLevel != nil { storedMuteLevel = nil }
         now.volume = v
+        revision += 1
         Task { _ = await bridge({ try MusicBridge.setVolume(v) }) }
     }
 

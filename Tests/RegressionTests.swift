@@ -19,6 +19,233 @@ struct RegressionTests {
         }
         assert(QueueTextParser.upcoming([.init(texts: ["History"], hasTrackMenu: false), .init(texts: ["Old song"], hasTrackMenu: true)]).isEmpty)
         print("PASS: native queue section boundaries, history exclusion, and empty AX value fallback")
+
+        // LibraryIndex: the column-per-property payload must survive metadata
+        // that contains the characters a naive delimiter would collide with.
+        let RS = "\u{1E}", GS = "\u{1D}", US = "\u{1F}"
+        let chunkA = ["PLA",
+                      ["11", "12"].joined(separator: RS),
+                      ["Tab\there", "New\nline"].joined(separator: RS),
+                      ["Artist A", "Artist B"].joined(separator: RS),
+                      ["Album A", "Album B"].joined(separator: RS),
+                      ["215.2", "216.3"].joined(separator: RS)].joined(separator: GS)
+        // An empty playlist sends empty columns, which must read as zero
+        // tracks rather than one blank one.
+        let chunkB = ["PLB", "", "", "", "", ""].joined(separator: GS)
+        let (parsed, counts) = LibraryIndex.parse([chunkA, chunkB].joined(separator: US))
+        assert(parsed.count == 2, "expected 2 tracks, got \(parsed.count)")
+        assert(parsed[0].name == "Tab\there" && parsed[1].name == "New\nline")
+        assert(parsed[0].sourcePlaylistID == "PLA")
+        assert(parsed[0].duration == 215.2)
+        assert(counts["PLA"] == 2 && counts["PLB"] == 0)
+
+        // A cloud track carrying `missing value` arrives as an empty field and
+        // must not drop the row or shift the columns after it.
+        let ragged = ["PLC", ["21", "22"].joined(separator: RS),
+                      ["Only", "Both"].joined(separator: RS),
+                      "", "", ""].joined(separator: GS)
+        let (raggedTracks, _) = LibraryIndex.parse(ragged)
+        assert(raggedTracks.count == 2 && raggedTracks[1].artist.isEmpty && raggedTracks[1].duration == 0)
+
+        assert(LibraryIndex.parse("").0.isEmpty)
+        print("PASS: library index payload parsing, empty playlists and missing properties")
+
+        // Matching: folding, multi-term AND, title-first ordering, and the
+        // dedup rule that keeps a single and an album cut apart.
+        let single = MusicTrack(databaseID: 854, name: "ハイキ", artist: "リーガルリリー",
+                                album: "ハイキ - Single", duration: 215.2, sourcePlaylistID: "PLA")
+        let albumCut = MusicTrack(databaseID: 821, name: "ハイキ", artist: "リーガルリリー",
+                                  album: "kirin", duration: 216.3, sourcePlaylistID: "PLB")
+        let dupe = MusicTrack(databaseID: 999, name: "ハイキ", artist: "リーガルリリー",
+                              album: "ハイキ - Single", duration: 215.2, sourcePlaylistID: "PLC")
+        let byArtist = MusicTrack(databaseID: 700, name: "Memories", artist: "ハイキ Band",
+                                  album: "X", duration: 60, sourcePlaylistID: "PLA")
+        let catalogue = [byArtist, single, albumCut, dupe]
+
+        let hits = LibraryIndex.match(catalogue, query: "ハイキ")
+        assert(hits.count == 3, "same song in two playlists collapses, different masters do not: \(hits.count)")
+        assert(hits.map(\.databaseID) == [854, 821, 700], "title matches come before artist matches")
+        assert(LibraryIndex.match(catalogue, query: "MEMORIES").count == 1, "case folding")
+        assert(LibraryIndex.match(catalogue, query: "ﾊｲｷ").count == 3, "half-width kana folding")
+        assert(LibraryIndex.match(catalogue, query: "ハイキ kirin").map(\.databaseID) == [821],
+               "every term must match")
+        assert(LibraryIndex.match(catalogue, query: "   ").isEmpty)
+        assert(LibraryIndex.match(catalogue, query: "ハイキ", limit: 1).count == 1)
+        print("PASS: library search folding, multi-term matching and release-aware dedup")
+
+        // The index loads once and is reused: a per-keystroke search must not
+        // pay for another round trip.
+        ScriptRunner.canned = chunkA
+        ScriptRunner.calls = 0
+        let index = LibraryIndex.shared
+        try index.reload()
+        assert(index.trackCount == 2)
+        _ = try index.search("Tab")
+        _ = try index.search("New")
+        assert(ScriptRunner.calls == 1, "index reloaded per search: \(ScriptRunner.calls)")
+        assert(index.playlistCounts()["PLA"] == 2)
+        print("PASS: library index caches one load across searches")
+
+        // A song added to the library after the snapshot was taken has to be
+        // findable: the refresh action drops the snapshot rather than waiting
+        // for it to age out.
+        let RS3 = "\u{1E}", GS3 = "\u{1D}"
+        func chunk(_ ids: [String]) -> String {
+            [ "PLA",
+              ids.joined(separator: RS3),
+              ids.map { "song \($0)" }.joined(separator: RS3),
+              ids.map { _ in "artist" }.joined(separator: RS3),
+              ids.map { _ in "album" }.joined(separator: RS3),
+              ids.map { _ in "100" }.joined(separator: RS3) ].joined(separator: GS3)
+        }
+        ScriptRunner.canned = chunk(["11", "12"])
+        try index.reload()
+        var found = try index.search("song").count
+        assert(found == 2)
+        // The user adds a track in Music.
+        ScriptRunner.canned = chunk(["11", "12", "13"])
+        found = try index.search("song").count
+        assert(found == 2, "the cached snapshot is reused")
+        index.invalidate()
+        found = try index.search("song").count
+        assert(found == 3, "refresh must pick up the new track")
+        assert(index.isFresh(within: 60) && !index.isFresh(within: 0))
+        print("PASS: refreshing the library picks up newly added songs")
+
+        // Recently added songs come first, and the tracks Music gives no date
+        // for — every entry of a subscription playlist — must keep a stable
+        // order instead of being reshuffled by an unstable sort on each keystroke.
+        func chunkDated(_ rows: [(String, String, String)]) -> String {
+            [ "PLD",
+              rows.map { $0.0 }.joined(separator: RS3),
+              rows.map { $0.1 }.joined(separator: RS3),
+              rows.map { _ in "artist" }.joined(separator: RS3),
+              rows.map { _ in "album" }.joined(separator: RS3),
+              rows.map { _ in "100" }.joined(separator: RS3),
+              rows.map { $0.2 }.joined(separator: RS3) ].joined(separator: GS3)
+        }
+        ScriptRunner.canned = chunkDated([
+            ("1", "song old",   "1000"),
+            ("2", "song undated a", "0"),
+            ("3", "song new",   "9000"),
+            ("4", "song undated b", "0"),
+        ])
+        index.invalidate()
+        let ranked = try index.search("song")
+        assert(ranked.map(\MusicTrack.name) == ["song new", "song old", "song undated a", "song undated b"],
+               "newest first, undated last in load order: \(ranked.map(\MusicTrack.name))")
+        for _ in 0..<20 {
+            let again = try index.search("song").map(\MusicTrack.name)
+            assert(again == ranked.map(\MusicTrack.name),
+                   "the order must not change between identical searches")
+        }
+        // A playlist whose date column is missing entirely still yields tracks.
+        ScriptRunner.canned = ["PLE", "7", "song lone", "a", "b", "100"].joined(separator: GS3)
+        index.invalidate()
+        let lone = try index.search("lone").count
+        assert(lone == 1, "a missing date column must not drop the playlist")
+        print("PASS: recently added first, undated tracks keep a stable order")
+
+        // A duration that is not a usable number must not reach the UI: it ends
+        // up as the upper bound of the progress slider's range.
+        let GS2 = "\u{1D}", RS2 = "\u{1E}"
+        let nasty = ["PLD", ["1", "2", "3", "4"].joined(separator: RS2),
+                     ["a", "b", "c", "d"].joined(separator: RS2),
+                     ["x", "x", "x", "x"].joined(separator: RS2),
+                     ["y", "y", "y", "y"].joined(separator: RS2),
+                     ["nan", "inf", "-5", ""].joined(separator: RS2)].joined(separator: GS2)
+        let (nastyTracks, _) = LibraryIndex.parse(nasty)
+        assert(nastyTracks.count == 4)
+        for t in nastyTracks {
+            assert(t.duration.isFinite && t.duration >= 0, "bad duration survived: \(t.duration)")
+        }
+        print("PASS: unusable durations are rejected at the parser")
+
+        // setShuffle(false) deliberately leaves played entries alone, so the
+        // order shuffling started from has to be kept for the explicit restore.
+        let orderDir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: orderDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: orderDir) }
+        let orderURL = orderDir.appendingPathComponent("order.json")
+        let ordered = QueueStore(fileURL: orderURL)
+        ordered.append((1...6).map { MusicTrack(databaseID: $0, name: "o\($0)", artist: "a", album: "b", duration: 10) })
+        let ids = ordered.items.map(\QueueItem.id)
+        ordered.setShuffle(true)
+        _ = ordered.select(ordered.items[4].id)
+        ordered.setShuffle(false)
+        // Played entries keep their shuffled place — that invariant stays.
+        assert(ordered.items.map(\QueueItem.id) != ids || !ordered.canRestoreOriginalOrder)
+        let reopened = QueueStore(fileURL: orderURL)
+        reopened.restoreOriginalOrder()
+        assert(reopened.items.map(\QueueItem.id) == ids, "the original order must survive a restart and a restore")
+        assert(!reopened.shuffleActive)
+        print("PASS: the pre-shuffle order outlives a restore and a relaunch")
+
+        // Borrowing Music's repeat mode changes another app's settings. If
+        // Music quits mid-queue the in-memory record dies with the connection,
+        // and the user was left on repeat-one permanently.
+        UserDefaults.standard.removeObject(forKey: "borrowedRepeatMode")
+        MusicBridge.isRunning = true
+        MusicBridge.snapshot = NowPlaying()
+        MusicBridge.snapshot.repeatMode = "all"
+        MusicBridge.repeatWrites = []
+        MusicBridge.plays = []
+        MusicBridge.missing = false
+        let borrowURL = orderDir.appendingPathComponent("borrow.json")
+        let borrowStore = QueueStore(fileURL: borrowURL)
+        borrowStore.append((1...3).map { MusicTrack(databaseID: $0, name: "b\($0)", artist: "a", album: "b", duration: 10) })
+        let borrower = PlayerController(store: borrowStore, startPolling: false)
+        await borrower.startQueueFromTop()
+        assert(MusicBridge.snapshot.repeatMode == "one", "the queue takes repeat-one while it drives playback")
+        assert(UserDefaults.standard.string(forKey: "borrowedRepeatMode") == "all")
+        MusicBridge.isRunning = false
+        await borrower.tick()
+        MusicBridge.isRunning = true
+        await borrower.tick()
+        assert(MusicBridge.snapshot.repeatMode == "all",
+               "Music quitting mid-queue must not keep the user on repeat-one")
+        assert(UserDefaults.standard.string(forKey: "borrowedRepeatMode") == nil)
+        UserDefaults.standard.removeObject(forKey: "borrowedRepeatMode")
+        print("PASS: the borrowed repeat mode is returned even if Music quits mid-queue")
+
+        // Music's mute property cannot be written through AppleScript, so a
+        // mute is a volume drop that has to remember the level to come back to.
+        UserDefaults.standard.removeObject(forKey: "mutedVolume")
+        MusicBridge.snapshot = NowPlaying()
+        MusicBridge.snapshot.volume = 63
+        MusicBridge.volumeWrites = []
+        let muteStore = QueueStore(fileURL: orderDir.appendingPathComponent("mute.json"))
+        MusicBridge.isRunning = true
+        var muter = PlayerController(store: muteStore, startPolling: false)
+        await muter.tick()   // the controller can only remember a level it has read
+        // The volume write is dispatched, so wait for it rather than assuming
+        // a fixed number of yields is enough.
+        func settle(until condition: @escaping () -> Bool) async {
+            for _ in 0..<200 {
+                if condition() { return }
+                try? await Task.sleep(nanoseconds: 10_000_000)
+            }
+        }
+        muter.toggleMute()
+        await settle { MusicBridge.snapshot.volume == 0 }
+        assert(muter.isMuted && MusicBridge.snapshot.volume == 0, "mute silences Music")
+
+        // A restart must not strand the user at zero with the level forgotten.
+        muter = PlayerController(store: muteStore, startPolling: false)
+        assert(muter.isMuted, "the muted level survives a relaunch")
+        muter.toggleMute()
+        await settle { MusicBridge.snapshot.volume == 63 }
+        assert(!muter.isMuted && MusicBridge.snapshot.volume == 63, "unmute restores the level")
+
+        // Choosing a volume by hand cancels the mute instead of leaving a
+        // stale level that a later unmute would snap back to.
+        muter.toggleMute()
+        await settle { MusicBridge.snapshot.volume == 0 }
+        muter.setVolume(40)
+        await settle { MusicBridge.snapshot.volume == 40 }
+        assert(!muter.isMuted && MusicBridge.snapshot.volume == 40)
+        UserDefaults.standard.removeObject(forKey: "mutedVolume")
+        print("PASS: mute remembers the volume, survives a relaunch and yields to the slider")
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: directory) }
         let url = directory.appendingPathComponent("queue.json")

@@ -24,6 +24,9 @@ final class QueueStore: ObservableObject {
     @Published private(set) var shuffleActive = false
 
     private var preShuffleOrder: [UUID]?
+    /// The last order shuffling started from, kept after a restore so the list
+    /// can still be put back in full. See `restoreOriginalOrder()`.
+    private var shuffleOriginOrder: [UUID]?
 
     @Published private(set) var persistenceError: String?
     private let fileURL: URL
@@ -42,6 +45,7 @@ final class QueueStore: ObservableObject {
         var consumeOnPlay: Bool?
         var shuffleActive: Bool?
         var preShuffleOrder: [UUID]?
+        var shuffleOriginOrder: [UUID]?
     }
 
     init(fileURL: URL? = nil) {
@@ -109,9 +113,41 @@ final class QueueStore: ObservableObject {
             // at the end in the order it was added.
             let added = pending.filter { rank[$0.id] == nil }
             items = history + known + added
+            // Entries already visited keep their shuffled position on purpose,
+            // so switching shuffle off neither replays nor skips them. That
+            // leaves the played prefix out of the original order for good, so
+            // hold on to the original: without it a later restore has nothing
+            // to work from, and the list can never be put back.
+            shuffleOriginOrder = order
             preShuffleOrder = nil
         }
         shuffleActive = on
+        save()
+    }
+
+    /// Puts every entry back in the order shuffling started from, including
+    /// the part already played. `setShuffle(false)` deliberately leaves played
+    /// entries where they are; this is the explicit "I want the album order
+    /// back" action, and it may move the playing track's index.
+    var canRestoreOriginalOrder: Bool {
+        guard let order = preShuffleOrder ?? shuffleOriginOrder else { return false }
+        var rank: [UUID: Int] = [:]
+        for (i, id) in order.enumerated() { rank[id] = i }
+        let known = items.filter { rank[$0.id] != nil }
+        return known.map { rank[$0.id]! } != known.map { rank[$0.id]! }.sorted()
+    }
+
+    func restoreOriginalOrder() {
+        guard let order = preShuffleOrder ?? shuffleOriginOrder else { return }
+        var rank: [UUID: Int] = [:]
+        for (i, id) in order.enumerated() { rank[id] = i }
+        let known = items.filter { rank[$0.id] != nil }
+                         .sorted { rank[$0.id]! < rank[$1.id]! }
+        let added = items.filter { rank[$0.id] == nil }
+        items = known + added
+        shuffleActive = false
+        preShuffleOrder = nil
+        shuffleOriginOrder = nil
         save()
     }
 
@@ -134,6 +170,7 @@ final class QueueStore: ObservableObject {
         items.removeAll()
         shuffleActive = false
         preShuffleOrder = nil
+        shuffleOriginOrder = nil
         currentID = nil
         save()
     }
@@ -142,6 +179,7 @@ final class QueueStore: ObservableObject {
         items = tracks.map { QueueItem(track: $0) }
         shuffleActive = false
         preShuffleOrder = nil
+        shuffleOriginOrder = nil
         currentID = nil
         save()
     }
@@ -191,7 +229,8 @@ final class QueueStore: ObservableObject {
         let snapshot = Persisted(items: items, currentID: currentID,
                                  consumeOnPlay: consumeOnPlay,
                                  shuffleActive: shuffleActive,
-                                 preShuffleOrder: preShuffleOrder)
+                                 preShuffleOrder: preShuffleOrder,
+                                 shuffleOriginOrder: shuffleOriginOrder)
         do {
             let data = try JSONEncoder().encode(snapshot)
             try FileManager.default.createDirectory(at: fileURL.deletingLastPathComponent(),
@@ -215,6 +254,7 @@ final class QueueStore: ObservableObject {
             consumeOnPlay = p.consumeOnPlay ?? false
             shuffleActive = p.shuffleActive ?? false
             preShuffleOrder = p.preShuffleOrder
+            shuffleOriginOrder = p.shuffleOriginOrder
         } catch {
             persistenceError = "保存済みキューを読み込めません: \(error.localizedDescription)"
         }

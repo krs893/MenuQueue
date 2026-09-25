@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Extracts every AppleScript literal from MusicBridge.swift and syntax-checks
+"""Extracts every AppleScript literal from Sources/*.swift and syntax-checks
 it with osacompile. Music.app's dictionary steals plain identifiers like `st`,
 so this catches clashes without having to launch Music."""
 import re, subprocess, tempfile, os, sys, textwrap
 
-src = open('Sources/MusicBridge.swift').read()
+import glob
+src = "\n".join(open(f).read() for f in sorted(glob.glob('Sources/*.swift')))
 
 handler = re.search(r'private static let joinHandler = """\n(.*?)\n    """', src, re.S).group(1)
 handler = textwrap.dedent(handler)

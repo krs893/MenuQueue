@@ -50,7 +50,37 @@ enum UpNextReader {
     }
 
     private static func children(_ el: AXUIElement) -> [AXUIElement] {
-        (attr(el, kAXChildrenAttribute) as? [AXUIElement]) ?? []
+        var result = (attr(el, kAXChildrenAttribute) as? [AXUIElement]) ?? []
+        guard role(el) == kAXApplicationRole else { return result }
+        // Music's application element exposes only its menu bar under
+        // AXChildren, and AXWindows comes back empty (observed on macOS 26:
+        // err=0, array(0) while a window is on screen). The player window is
+        // reachable only through AXMainWindow / AXFocusedWindow, so splice
+        // those in — otherwise every traversal that starts at the app element
+        // stops at the menu bar and the queue button is never found.
+        for name in [kAXWindowsAttribute, kAXMainWindowAttribute, kAXFocusedWindowAttribute] {
+            guard let value = attr(el, name) else { continue }
+            let found: [AXUIElement]
+            if let array = value as? [AXUIElement] {
+                found = array
+            } else if CFGetTypeID(value) == AXUIElementGetTypeID() {
+                found = [(value as! AXUIElement)]
+            } else {
+                continue
+            }
+            for candidate in found {
+                // AXFocusedWindow answers with the application element itself
+                // when no window holds focus. Splicing that back in makes the
+                // app its own descendant: the walk then loops until it runs
+                // out of depth and never reaches the real window, which looks
+                // exactly like the queue button having disappeared.
+                guard role(candidate) == kAXWindowRole else { continue }
+                guard !CFEqual(candidate, el) else { continue }
+                guard !result.contains(where: { CFEqual($0, candidate) }) else { continue }
+                result.append(candidate)
+            }
+        }
+        return result
     }
 
     private static func str(_ el: AXUIElement, _ name: String) -> String {
@@ -111,6 +141,103 @@ enum UpNextReader {
         return result
     }
 
+    /// Roles whose subtree holds browsed content, never player chrome.
+    ///
+    /// Walking them is what made a read take half a minute: with a playlist on
+    /// screen the content area alone is ~900 elements and every child query is
+    /// a synchronous cross-process call, measured at 4.4s for one pass while
+    /// the whole tree is only ~1200 nodes. The queue button lives in the mini
+    /// player group at depth 6, so none of that is worth visiting.
+    /// One IPC round trip per element instead of one per attribute.
+    ///
+    /// Every AXUIElementCopyAttributeValue is a synchronous call into Music.
+    /// Walking 143 queue rows twice — once for their text, once to check for
+    /// the row menu — cost 3.7s; fetching the attributes together in a single
+    /// pass brings the same result back in 0.77s.
+    private static let nodeAttributes = [
+        kAXRoleAttribute, kAXIdentifierAttribute, kAXValueAttribute,
+        kAXTitleAttribute, kAXDescriptionAttribute, kAXChildrenAttribute
+    ] as CFArray
+
+    private struct Node {
+        var role = ""
+        var identifier = ""
+        var value: Any?
+        var title = ""
+        var desc = ""
+        var children: [AXUIElement] = []
+    }
+
+    private static func node(_ el: AXUIElement) -> Node {
+        var raw: CFArray?
+        var n = Node()
+        guard AXUIElementCopyMultipleAttributeValues(el, nodeAttributes, AXCopyMultipleAttributeOptions(), &raw) == .success,
+              let values = raw as? [Any], values.count >= 6
+        else { return n }
+        func string(_ i: Int) -> String { values[i] as? String ?? "" }
+        n.role = string(0)
+        n.identifier = string(1)
+        n.value = values[2]
+        n.title = string(3)
+        n.desc = string(4)
+        n.children = (values[5] as? [AXUIElement]) ?? []
+        return n
+    }
+
+    /// Collects a row's text and whether it carries a track menu in a single
+    /// traversal — the menu is what tells a real queue entry from a section
+    /// heading, so both answers are needed for every row.
+    private static func parseRow(_ row: AXUIElement) -> QueueTextParser.Row {
+        var texts: [String] = []
+        var hasTrackMenu = false
+        func visit(_ el: AXUIElement, _ depth: Int) {
+            guard depth <= 6 else { return }
+            let n = node(el)
+            if n.identifier == "actionButton" { hasTrackMenu = true }
+            if [kAXStaticTextRole, kAXTextAreaRole, "AXText"].contains(n.role) {
+                if let text = QueueTextParser.firstText([
+                    n.value as? String,
+                    (n.value as? NSAttributedString)?.string,
+                    n.title, n.desc
+                ]) { texts.append(text) }
+            }
+            for child in n.children { visit(child, depth + 1) }
+        }
+        visit(row, 0)
+        return QueueTextParser.Row(texts: texts, hasTrackMenu: hasTrackMenu)
+    }
+
+    private static let contentRoles: Set<String> = [
+        kAXTableRole, kAXOutlineRole, kAXListRole, kAXScrollAreaRole, "AXCollection"
+    ]
+
+    private static func rowCount(of list: AXUIElement) -> Int {
+        children(list).reduce(0) { $0 + (role($1) == kAXRowRole ? 1 : 0) }
+    }
+
+    private static var cachedButton: AXUIElement?
+
+    /// Music exposes the control as `Music.miniPlayer.queueButton`; the
+    /// identifier is stable across languages, unlike its 「次に再生」 label.
+    private static func queueButton(in axApp: AXUIElement) -> AXUIElement? {
+        if let cached = cachedButton, !labelBlob(cached).isEmpty { return cached }
+        cachedButton = nil
+
+        var result: AXUIElement?
+        func visit(_ el: AXUIElement, _ depth: Int) {
+            guard depth <= 10, result == nil else { return }
+            let r = role(el)
+            guard !contentRoles.contains(r) else { return }
+            if r == kAXButtonRole || r == kAXMenuButtonRole || r == "AXToggleButton" {
+                if matchesUpNext(labelBlob(el)) { result = el; return }
+            }
+            for child in children(el) { visit(child, depth + 1) }
+        }
+        visit(axApp, 0)
+        cachedButton = result
+        return result
+    }
+
     // MARK: Public entry point
 
     /// Opens Music.app's Up Next popover, scrapes it, and closes it again.
@@ -127,46 +254,83 @@ enum UpNextReader {
 
         let axApp = AXUIElementCreateApplication(app.processIdentifier)
 
-        guard let button = find(in: axApp, limit: 18, { el in
-            let r = role(el)
-            guard r == kAXButtonRole || r == kAXMenuButtonRole || r == "AXToggleButton" else { return false }
-            return matchesUpNext(labelBlob(el))
-        }) else { throw ReadError.buttonNotFound }
+        guard let button = queueButton(in: axApp) else { throw ReadError.buttonNotFound }
 
-        func lists() -> [AXUIElement] {
-            var result: [AXUIElement] = []
+        // One traversal answers every question below. The previous shape ran
+        // `lists()` and two `find(in: axApp,)` sweeps, then repeated all of
+        // them after opening the popover — five-plus full passes over a tree
+        // that costs seconds each time.
+        struct Survey {
+            var lists: [AXUIElement] = []
+            var labelled: AXUIElement?
+            var headerRegion: AXUIElement?
+        }
+        func survey() -> Survey {
+            var out = Survey()
             func visit(_ element: AXUIElement, depth: Int) {
                 guard depth < 18 else { return }
                 let r = role(element)
-                if [kAXTableRole, kAXOutlineRole, kAXListRole].contains(r) {
-                    result.append(element)
+                if r == "AXCollection" { return }
+                let isList = [kAXTableRole, kAXOutlineRole, kAXListRole].contains(r)
+                if isList {
+                    out.lists.append(element)
+                    if out.labelled == nil, matchesUpNext(labelBlob(element)) { out.labelled = element }
                     return
                 }
-                if r == "AXCollection" { return }
+                if out.headerRegion == nil,
+                   str(element, kAXIdentifierAttribute) == "headerContainer",
+                   matchesUpNext(labelBlob(element)) {
+                    out.headerRegion = element
+                }
                 for child in children(element) { visit(child, depth: depth + 1) }
             }
             visit(axApp, depth: 0)
-            return result
+            return out
         }
-        func labelledList() -> AXUIElement? {
-            if let labelled = find(in: axApp, limit: 24, { el in
-                matchesUpNext(labelBlob(el)) &&
-                [kAXTableRole, kAXOutlineRole, kAXListRole].contains(role(el))
-            }) { return labelled }
+        /// The queue table has no label and no identifier; what marks it is
+        /// that its rows carry the per-track action menu. Used only to tell
+        /// whether the popover is currently on screen.
+        func queueTable(_ s: Survey) -> AXUIElement? {
+            for list in s.lists where role(list) != kAXOutlineRole {
+                let rows = children(list).filter { role($0) == kAXRowRole }
+                guard !rows.isEmpty else { continue }
+                let hasMenus = rows.prefix(3).contains { row in
+                    find(in: row, limit: 5) { str($0, kAXIdentifierAttribute) == "actionButton" } != nil
+                }
+                if hasMenus { return list }
+            }
+            return nil
+        }
+        func queueList(_ s: Survey) -> AXUIElement? {
+            if let labelled = s.labelled { return labelled }
             // Current Music labels the surrounding container "再生キュー";
             // its table itself has no label.
-            guard let region = find(in: axApp, limit: 24, { el in
-                str(el, kAXIdentifierAttribute) == "headerContainer" && matchesUpNext(labelBlob(el))
-            }) else { return nil }
+            guard let region = s.headerRegion else { return nil }
             return find(in: region, limit: 6) { [kAXTableRole, kAXListRole].contains(role($0)) }
         }
 
-        var target = labelledList()
-        let before = target == nil ? lists() : []
+        var scan = survey()
+        // A queue list with no rows is the popover Music is still tearing down
+        // after the previous read closed it. Accepting it returned an empty
+        // queue on every other refresh, so treat it as not found and reopen.
+        var target = queueList(scan).flatMap { rowCount(of: $0) > 0 ? $0 : nil }
+        let before = target == nil ? scan.lists : []
         var opened = false
-        defer {
-            if opened { AXUIElementPerformAction(button, kAXPressAction as CFString) }
+        func closePopover() {
+            AXUIElementPerformAction(button, kAXPressAction as CFString)
+            // Music's queue table carries no label and its button reports no
+            // open/closed state, so the only way to recognise the queue is
+            // "the list that appeared after pressing". That only holds if the
+            // popover is actually shut by the time the next read starts —
+            // otherwise the next read finds nothing new and comes back empty,
+            // which showed as the queue alternating between full and blank.
+            let closeBy = Date().addingTimeInterval(1.5)
+            repeat {
+                Thread.sleep(forTimeInterval: 0.05)
+                if queueTable(survey()) == nil { return }
+            } while Date() < closeBy
         }
+        defer { if opened { closePopover() } }
         if target == nil {
             guard openIfNeeded else { throw ReadError.listNotFound }
             // Do not choose an arbitrary library table: only a labelled queue
@@ -177,24 +341,50 @@ enum UpNextReader {
                 throw ReadError.buttonNotFound
             }
             opened = true
-            Thread.sleep(forTimeInterval: 0.55)
-            target = labelledList()
-            if target == nil {
-                let fresh = lists().filter { candidate in !before.contains { CFEqual($0, candidate) } }
-                if fresh.count == 1 { target = fresh.first }
-            }
+            // Music fills the popover asynchronously. A fixed wait was
+            // sometimes shorter than that, and the read then returned an empty
+            // queue — visible as the list alternating between full and blank
+            // on repeated refreshes. Poll until rows show up instead.
+            let deadline = Date().addingTimeInterval(2.5)
+            var lastRowCount = -1
+            repeat {
+                Thread.sleep(forTimeInterval: 0.05)
+                scan = survey()
+                target = queueList(scan)
+                if target == nil {
+                    let fresh = scan.lists.filter { candidate in !before.contains { CFEqual($0, candidate) } }
+                    if fresh.count == 1 { target = fresh.first }
+                }
+                // Reading while Music is still filling the popover returned a
+                // partial list (66 of 143 rows) whose visible section was all
+                // history, so the queue came back empty. Wait for the count to
+                // stop growing before trusting it.
+                if let found = target {
+                    let count = rowCount(of: found)
+                    if count > 0, count == lastRowCount { break }
+                    lastRowCount = count
+                }
+            } while Date() < deadline
         }
         guard let target else { throw ReadError.listNotFound }
-        var rows: [AXUIElement] = []
-        collect(in: target, limit: 6, into: &rows) { role($0) == kAXRowRole }
+        // Rows are direct children of the table. The generic collector kept
+        // descending into each one looking for more rows, which walked all 143
+        // subtrees and cost 2.5s of a 4s read — longer than everything else
+        // combined. Take the children directly and only fall back to a search
+        // that stops at the first row of each branch.
+        var rows = children(target).filter { role($0) == kAXRowRole }
+        if rows.isEmpty {
+            func gather(_ el: AXUIElement, _ depth: Int) {
+                guard depth <= 6 else { return }
+                if role(el) == kAXRowRole { rows.append(el); return }
+                for child in children(el) { gather(child, depth + 1) }
+            }
+            gather(target, 0)
+        }
         if rows.isEmpty {
             rows = children(target).filter { [kAXGroupRole, kAXCellRole].contains(role($0)) }
         }
-        let parsed = rows.prefix(2000).map { row in
-            QueueTextParser.Row(texts: texts(of: row), hasTrackMenu: find(in: row, limit: 5) {
-                str($0, kAXIdentifierAttribute) == "actionButton"
-            } != nil)
-        }
+        let parsed = rows.prefix(2000).map(parseRow)
         return QueueTextParser.upcoming(parsed).map { UpNextRow(title: $0.title, subtitle: $0.subtitle) }
 
     }
@@ -220,6 +410,22 @@ extension UpNextReader {
             guard let app = NSRunningApplication.runningApplications(withBundleIdentifier: MusicBridge.bundleID).first
             else { throw ReadError.notRunning }
             let axApp = AXUIElementCreateApplication(app.processIdentifier)
+            // `reveal` is the only way to put a playlist on screen so its
+            // toolbar menu can be driven, and it brings Music to the front.
+            // Adding to the queue from a menu bar app should not steal the
+            // screen, so put the previous app back when we are done.
+            let previousApp = NSWorkspace.shared.frontmostApplication
+            defer {
+                if let previousApp, previousApp.bundleIdentifier != MusicBridge.bundleID {
+                    previousApp.activate()
+                }
+            }
+            // `reveal` only actually switches the browser view when Music is
+            // the active app — without this the view never changes, the check
+            // below times out, and adding to the queue fails for no visible
+            // reason. Activate deliberately, then hand the screen back.
+            app.activate()
+            Thread.sleep(forTimeInterval: 0.15)
             // Identify the playlist by its persistent ID, never an ambiguous name.
             try MusicBridge.revealPlaylist(persistentID)
             var more: AXUIElement?
@@ -230,7 +436,7 @@ extension UpNextReader {
                     }
                     if more != nil { break }
                 }
-                Thread.sleep(forTimeInterval: 0.1)
+                Thread.sleep(forTimeInterval: 0.05)
             }
             guard (try? MusicBridge.displayedPlaylistID()) == persistentID else { throw AddError.playlistNotShown }
             guard let more, AXUIElementPerformAction(more, kAXPressAction as CFString) == .success

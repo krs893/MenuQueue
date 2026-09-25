@@ -1,5 +1,6 @@
 import AppKit
 import SwiftUI
+import Combine
 
 @MainActor
 final class MenuPanel: NSPanel {
@@ -20,20 +21,57 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var store: QueueStore!
     private var player: PlayerController!
     private var playerWindow: NSWindow?
+    private var cancellables = Set<AnyCancellable>()
+
+    /// Menu bar space is shared with every other app, so the title is capped
+    /// and the artist is dropped before the track name is.
+    private static let titleLimit = 34
+
+    private func updateStatusTitle(_ snapshot: NowPlaying) {
+        guard let button = statusItem?.button else { return }
+        guard let track = snapshot.track, snapshot.state != .stopped else {
+            button.attributedTitle = NSAttributedString(string: "")
+            button.imagePosition = .imageOnly
+            button.toolTip = "MenuQueue"
+            return
+        }
+
+        var label = track.name
+        if !track.artist.isEmpty, label.count + track.artist.count + 3 <= Self.titleLimit {
+            label += " — " + track.artist
+        }
+        if label.count > Self.titleLimit {
+            label = String(label.prefix(Self.titleLimit - 1)) + "…"
+        }
+
+        button.imagePosition = .imageLeading
+        button.attributedTitle = NSAttributedString(string: " " + label, attributes: [
+            .font: NSFont.systemFont(ofSize: 12),
+            // A paused track stays readable but recedes.
+            .foregroundColor: snapshot.state.isPlaying ? NSColor.labelColor : NSColor.secondaryLabelColor
+        ])
+        button.toolTip = [track.name, track.artist, track.album]
+            .filter { !$0.isEmpty }.joined(separator: " — ")
+    }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         store = QueueStore()
         player = PlayerController(store: store)
 
-        statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
+        statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         if let button = statusItem.button {
-            button.image = NSImage(systemSymbolName: "music.note.list", accessibilityDescription: "MenuQueue")
+            button.image = NSImage(systemSymbolName: "music.note", accessibilityDescription: "MenuQueue")
             button.image?.isTemplate = true
-            button.imagePosition = .imageOnly
+            button.imagePosition = .imageLeading
             button.target = self
             button.action = #selector(statusItemClicked(_:))
             button.sendAction(on: [.leftMouseUp, .rightMouseUp])
         }
+        // Keep the menu bar showing whatever is playing.
+        player.$now
+            .receive(on: RunLoop.main)
+            .sink { [weak self] snapshot in self?.updateStatusTitle(snapshot) }
+            .store(in: &cancellables)
 
         menuPanel = MenuPanel(contentRect: .zero,
                               styleMask: [.borderless, .nonactivatingPanel],

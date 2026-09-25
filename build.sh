@@ -46,6 +46,26 @@ swiftc \
 
 # Ad-hoc signing supports local use. A changed binary may require Automation
 # or Accessibility permission again; a stable identifier alone does not prevent this.
-codesign --force --sign - --identifier jp.local.menuqueue "$APP"
+# An ad-hoc signature is identified by the binary's cdhash, so every rebuild
+# produces a new identity and macOS quietly drops the Accessibility grant:
+# the entry stays visible and switched on in System Settings while
+# AXIsProcessTrusted() returns false, with no new prompt. Signing with a
+# local self-signed certificate keeps the identity stable across rebuilds.
+IDENTITY="MenuQueue Local Signing"
+if security find-identity -v -p codesigning 2>/dev/null | grep -q "$IDENTITY"; then
+    codesign --force --sign "$IDENTITY" --identifier jp.local.menuqueue "$APP"
+    echo "signed with: $IDENTITY (Accessibility grant survives rebuilds)"
+else
+    PREVIOUS=$(codesign -dvvv "$HOME/Applications/MenuQueue.app" 2>&1 | awk -F= '/^CDHash=/{print $2; exit}')
+    codesign --force --sign - --identifier jp.local.menuqueue "$APP"
+    CURRENT=$(codesign -dvvv "$APP" 2>&1 | awk -F= '/^CDHash=/{print $2; exit}')
+    echo "signed ad-hoc"
+    if [ -n "$PREVIOUS" ] && [ "$PREVIOUS" != "$CURRENT" ]; then
+        echo "  note: cdhash changed ($PREVIOUS -> $CURRENT)."
+        echo "  The installed app's Accessibility grant no longer matches. After installing, run:"
+        echo "    tccutil reset Accessibility jp.local.menuqueue"
+        echo "  then reopen the app and approve the prompt."
+    fi
+fi
 
 echo "built → $APP"

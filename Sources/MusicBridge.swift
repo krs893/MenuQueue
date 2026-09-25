@@ -109,8 +109,9 @@ enum MusicBridge {
             set mqShuffle to ((shuffle enabled) as text)
             set mqRepeat to ((song repeat) as text)
             set mqVol to ((sound volume) as text)
+            set mqMute to ((mute) as text)
         end tell
-        return my joinList({mqState, mqID, mqName, mqArtist, mqAlbum, mqDur, mqPos, mqShuffle, mqRepeat, mqVol})
+        return my joinList({mqState, mqID, mqName, mqArtist, mqAlbum, mqDur, mqPos, mqShuffle, mqRepeat, mqVol, mqMute})
         """
         let raw = try ScriptRunner.shared.string(src)
         let f = raw.components(separatedBy: RS)
@@ -127,6 +128,7 @@ enum MusicBridge {
         np.shuffle = (f[7] == "true")
         np.repeatMode = f[8]
         np.volume = Int(Double(f[9]) ?? 100)
+        np.muted = f.count > 10 && f[10] == "true"
         return np
     }
 
@@ -207,6 +209,13 @@ enum MusicBridge {
         return try ScriptRunner.shared.string(src) == "ok"
     }
 
+    /// No longer reachable from the UI: driving Music's toolbar menu through
+    /// Accessibility cannot work on macOS 26, where that toolbar reports no
+    /// children at all. Kept so the existing tests still describe the path.
+    static func enqueuePlaylist(_ id: String) throws -> QueueInsertionPosition {
+        try UpNextReader.enqueuePlaylist(id)
+    }
+
     static func playPlaylist(_ persistentID: String) throws {
         let pid = esc(persistentID)
         let src = """
@@ -218,9 +227,6 @@ enum MusicBridge {
         try ScriptRunner.shared.run(src)
     }
 
-    static func enqueuePlaylist(_ id: String) throws -> QueueInsertionPosition {
-        try UpNextReader.enqueuePlaylist(id)
-    }
 
     static func revealPlaylist(_ persistentID: String) throws {
         let pid = esc(persistentID)
@@ -231,10 +237,21 @@ enum MusicBridge {
         """)
     }
 
+    /// The playlist currently shown in Music's browser window, or "" when the
+    /// window is showing something without one — Home, a store page, or no
+    /// window at all. Coercing that to text throws a type error, which used to
+    /// abort the whole enqueue with a misleading message.
     static func displayedPlaylistID() throws -> String {
         try ScriptRunner.shared.string("""
         tell application id "com.apple.Music"
-            return persistent ID of view of front browser window
+            try
+                set mqView to (view of front browser window)
+                set mqID to (persistent ID of mqView)
+                if mqID is missing value then return ""
+                return (mqID as text)
+            on error
+                return ""
+            end try
         end tell
         """)
     }
@@ -290,12 +307,23 @@ enum MusicBridge {
         // The join loop below operates entirely on local AppleScript lists.
         let src = joinHandler + """
         tell application id "com.apple.Music"
+            -- Bulk property access throws on an empty playlist: `every track`
+            -- returns {} but `database ID of every track` fails. Answer with
+            -- empty lists so an empty (often smart) playlist is not an error.
             set mqPL to (first user playlist whose persistent ID is "\(pid)")
-            set mqIDs to database ID of every track of mqPL
+            if (count of tracks of mqPL) is 0 then
+                set mqIDs to {}
+                set mqNames to {}
+                set mqArtists to {}
+                set mqAlbums to {}
+                set mqDurations to {}
+            else
+                            set mqIDs to database ID of every track of mqPL
             set mqNames to name of every track of mqPL
             set mqArtists to artist of every track of mqPL
             set mqAlbums to album of every track of mqPL
             set mqDurations to duration of every track of mqPL
+            end if
         end tell
         set mqOut to {}
         repeat with mqI from 1 to (count of mqIDs)
