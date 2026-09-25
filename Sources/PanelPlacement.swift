@@ -3,8 +3,19 @@ import Foundation
 /// Screen coordinates may be negative (a display to the left or below the main
 /// display). Clamp exclusively to the screen containing the actual click.
 enum PanelPlacement {
+    /// Tall enough for the controls plus a handful of list rows, and no
+    /// taller: the panel drops from the menu bar, so every extra point runs
+    /// down the screen. Override with
+    /// `defaults write jp.local.menuqueue panelHeight -int 560`.
+    static var preferredSize: CGSize {
+        let configured = UserDefaults.standard.integer(forKey: "panelHeight")
+        let height = configured > 0 ? min(max(configured, 260), 900) : 470
+        return CGSize(width: 400, height: CGFloat(height))
+    }
+
     static func frame(click: CGPoint, button: CGRect?, screen: CGRect,
-                      visible: CGRect, preferred: CGSize = CGSize(width: 440, height: 660)) -> CGRect {
+                      visible: CGRect, preferred: CGSize? = nil) -> CGRect {
+        let preferred = preferred ?? preferredSize
         let margin: CGFloat = 8
         let width = min(preferred.width, max(1, visible.width - margin * 2))
         let height = min(preferred.height, max(1, visible.height - margin * 2))

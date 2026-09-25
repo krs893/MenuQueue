@@ -41,7 +41,9 @@ struct ContentView: View {
                 }.padding(.horizontal, 12).padding(.bottom, 6)
             }
         }
-        .frame(minWidth: 360, minHeight: 420, maxHeight: .infinity)
+        // Below the panel's own height, so the panel sets the size rather than
+        // the content pushing it taller.
+        .frame(minWidth: 340, minHeight: 300, maxHeight: .infinity)
         .onAppear {
             library.loadPlaylists()
         }
