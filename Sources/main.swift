@@ -22,6 +22,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var player: PlayerController!
     private var playerWindow: NSWindow?
     private var cancellables = Set<AnyCancellable>()
+    private let mediaKeys = MediaKeyTap()
 
     /// Menu bar space is shared with every other app — the user wants room for
     /// other status items — so the width is a constant and long titles scroll
@@ -128,6 +129,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             button.action = #selector(statusItemClicked(_:))
             button.sendAction(on: [.leftMouseUp, .rightMouseUp])
         }
+        // Next / previous on the keyboard walk this app's queue while it is in
+        // charge; otherwise the keys go to Music as usual.
+        mediaKeys.shouldIntercept = { [weak self] in self?.player.owns ?? false }
+        mediaKeys.onNext = { [weak self] in self?.player.next() }
+        mediaKeys.onPrevious = { [weak self] in self?.player.previous() }
+        mediaKeys.start()
+
         // Keep the menu bar showing whatever is playing.
         player.$now
             .receive(on: RunLoop.main)
@@ -161,6 +169,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        mediaKeys.stop()
         marqueeTimer?.invalidate()
         marqueeTimer = nil
         dismissPanel()

@@ -290,6 +290,25 @@ struct RegressionTests {
         UserDefaults.standard.set(true, forKey: "gaplessTakeover")
         print("PASS: picking a track plays on through the rest of its playlist")
 
+        // Media keys arrive packed into data1: key code in the high 16 bits,
+        // state in the next byte (0x0A down, 0x0B up), repeat in bit 0.
+        func packed(_ code: Int, down: Bool, repeating: Bool = false) -> Int {
+            (code << 16) | ((down ? 0x0A : 0x0B) << 8) | (repeating ? 1 : 0)
+        }
+        assert(MediaKey.decode(data1: packed(17, down: true)) == .init(key: .next, isDown: true, isRepeat: false))
+        assert(MediaKey.decode(data1: packed(18, down: false)) == .init(key: .previous, isDown: false, isRepeat: false))
+        assert(MediaKey.decode(data1: packed(16, down: true, repeating: true))?.isRepeat == true)
+        // Some keyboards send fast / rewind for next / previous.
+        assert(MediaKey.decode(data1: packed(19, down: true))?.key.isNext == true)
+        assert(MediaKey.decode(data1: packed(20, down: true))?.key.isPrevious == true)
+        // Play/pause is decoded but is neither, so it always goes to Music.
+        let play = MediaKey.decode(data1: packed(16, down: true))!.key
+        assert(!play.isNext && !play.isPrevious)
+        // Anything that is not a media key — brightness, volume — is ignored.
+        assert(MediaKey.decode(data1: packed(0, down: true)) == nil)
+        assert(MediaKey.decode(data1: packed(7, down: true)) == nil)
+        print("PASS: media key events decode to next, previous and play")
+
         // A duration that is not a usable number must not reach the UI: it ends
         // up as the upper bound of the progress slider's range.
         let GS2 = "\u{1D}", RS2 = "\u{1E}"

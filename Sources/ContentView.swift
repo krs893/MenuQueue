@@ -357,6 +357,34 @@ struct ArtworkThumbnail: View {
     }
 }
 
+/// Whether the media keys are being handled, and a way to grant the
+/// permission they need. Rechecked every couple of seconds, since the grant
+/// happens in System Settings rather than here.
+struct MediaKeyStatusRow: View {
+    @State private var trusted = MediaKeyTap.isTrusted
+    private let tick = Timer.publish(every: 2, on: .main, in: .common).autoconnect()
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "playpause")
+                .frame(width: 28)
+                .foregroundStyle(trusted ? AnyShapeStyle(.primary) : AnyShapeStyle(.secondary))
+            VStack(alignment: .leading, spacing: 2) {
+                Text("メディアキー").font(.system(size: 12))
+                Text(trusted ? "キュー再生中は次へ・前へをキューで処理します"
+                             : "アクセシビリティの許可が必要です")
+                    .font(.system(size: 10)).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Spacer(minLength: 0)
+            if !trusted {
+                Button("許可") { MediaKeyTap.requestTrust() }.controlSize(.small)
+            }
+        }
+        .onReceive(tick) { _ in trusted = MediaKeyTap.isTrusted }
+    }
+}
+
 struct TrackPickRow: View {
     let track: MusicTrack
     var isPlaying: Bool = false
@@ -425,6 +453,8 @@ struct SettingsPanel: View {
                 if let error = loginItemError {
                     Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange).help(error)
                 }
+                Divider()
+                MediaKeyStatusRow()
                 Divider()
                 HStack {
                     Button(action: close) { Image(systemName: "chevron.left") }.help("戻る")
