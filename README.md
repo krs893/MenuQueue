@@ -85,10 +85,43 @@ defaults write jp.local.menuqueue panelHeight -int 560
 アクセシビリティは設定（歯車）の「メディアキー」行の「許可」から求められます。
 システム設定で許可すると、アプリを再起動しなくても数秒で有効になります。
 
-ad-hoc 署名のため、ソースを変えて再ビルドすると署名のハッシュが変わり、
-**両方の許可が無効になります**（システム設定上はオンのまま見えるのに効かない状態）。
-その場合は `tccutil reset AppleEvents jp.local.menuqueue` /
-`tccutil reset Accessibility jp.local.menuqueue` で記録を消してから許可し直してください。
+### 署名と許可
+
+`build.sh` はログインキーチェーンに `MenuQueue Local Signing` というコード署名用証明書が
+あればそれで署名します。すると許可の照合に使われる指定要件が
+
+```
+identifier "jp.local.menuqueue" and certificate leaf = H"…"
+```
+
+と**証明書に紐づく**ので、ソースを変えて再ビルドしても許可は残ります。
+証明書が無いと ad-hoc 署名になり、要件がバイナリのハッシュに紐づくため、
+再ビルドのたびに両方の許可が無効になります（システム設定上はオンのまま見えるのに効かない状態）。
+
+証明書はこのマシン専用の自己署名で、キーチェーンで「信頼」する設定は入れていません。
+署名には信頼は不要で、要件は証明書そのものを指すためです。作り方:
+
+```bash
+cat > cert.cnf <<'CNF'
+[ req ]
+distinguished_name = dn
+x509_extensions    = ext
+prompt             = no
+[ dn ]
+CN = MenuQueue Local Signing
+[ ext ]
+basicConstraints = critical, CA:false
+keyUsage         = critical, digitalSignature
+extendedKeyUsage = critical, codeSigning
+CNF
+openssl req -x509 -newkey rsa:2048 -nodes -days 3650 -keyout key.pem -out cert.pem -config cert.cnf
+openssl pkcs12 -export -inkey key.pem -in cert.pem -name "MenuQueue Local Signing" -out id.p12 -passout pass:tmp
+security import id.p12 -k ~/Library/Keychains/login.keychain-db -P tmp -T /usr/bin/codesign
+rm key.pem id.p12
+```
+
+ad-hoc から証明書に切り替えた直後の1回だけは、記録を消して許可し直す必要があります:
+`tccutil reset AppleEvents jp.local.menuqueue` / `tccutil reset Accessibility jp.local.menuqueue`
 `build.sh` は `MenuQueue Local Signing` という名前のコード署名証明書があれば
 そちらを使い、許可が再ビルドをまたいで残るようにします。
 

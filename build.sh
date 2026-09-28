@@ -52,9 +52,17 @@ swiftc \
 # AXIsProcessTrusted() returns false, with no new prompt. Signing with a
 # local self-signed certificate keeps the identity stable across rebuilds.
 IDENTITY="MenuQueue Local Signing"
-if security find-identity -v -p codesigning 2>/dev/null | grep -q "$IDENTITY"; then
-    codesign --force --sign "$IDENTITY" --identifier jp.local.menuqueue "$APP"
-    echo "signed with: $IDENTITY (Accessibility grant survives rebuilds)"
+# Not `-v`: that lists only identities the system trusts, and a local
+# self-signed certificate is not one. It does not need to be — codesign signs
+# with it all the same, and the designated requirement becomes the certificate
+# ("certificate leaf = H..."), so Automation and Accessibility grants survive
+# rebuilds instead of being tied to one binary's hash. Signing by the SHA-1
+# avoids picking up anything else with a similar name.
+IDENTITY_HASH=$(security find-identity -p codesigning 2>/dev/null \
+    | awk -v name="\"$IDENTITY\"" '$0 ~ name { print $2; exit }')
+if [ -n "$IDENTITY_HASH" ]; then
+    codesign --force --sign "$IDENTITY_HASH" --identifier jp.local.menuqueue "$APP"
+    echo "signed with: $IDENTITY ($IDENTITY_HASH) — permission grants survive rebuilds"
 else
     PREVIOUS=$(codesign -dvvv "$HOME/Applications/MenuQueue.app" 2>&1 | awk -F= '/^CDHash=/{print $2; exit}')
     codesign --force --sign - --identifier jp.local.menuqueue "$APP"
