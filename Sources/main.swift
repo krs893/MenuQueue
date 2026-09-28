@@ -36,72 +36,82 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return configured > 0 ? min(configured, 40) : 10
     }
     private static let titleFont = NSFont.systemFont(ofSize: 12)
-    private static let scrollInterval: TimeInterval = 0.28
 
-    /// Reserve exactly what the window needs rather than guessing a constant:
-    /// measured against full-width glyphs so a Japanese title fits, and only
-    /// while something is actually scrolling.
-    private static var scrollingItemWidth: CGFloat {
-        let sample = " " + String(repeating: "あ", count: titleWidth)
-        let measured = (sample as NSString).size(withAttributes: [.font: titleFont]).width
-        // Room for the icon and the button's own padding.
-        return ceil(measured) + 30
-    }
-
-    private var marqueeTimer: Timer?
-    private var marqueeStep = 0
+    private let ticker = TickerView(frame: .zero)
     private var marqueeText = ""
     private var marqueeIsPlaying = false
+    /// What is on screen now. The player publishes a snapshot on every poll,
+    /// and restarting the ticker for each one would snap it back to the start
+    /// every second, so only a change of title or of playing state counts.
+    private var renderedMarquee: String?
 
     private func setMarquee(text: String, playing: Bool) {
-        if text != marqueeText {
-            marqueeText = text
-            marqueeStep = 0
-        }
+        let key = "\(playing)|\(text)"
+        guard key != renderedMarquee else { return }
+        renderedMarquee = key
+        marqueeText = text
         marqueeIsPlaying = playing
-        let needsScroll = playing && Marquee.scrolls(text, width: Self.titleWidth)
-        if needsScroll {
-            if marqueeTimer == nil {
-                let timer = Timer(timeInterval: Self.scrollInterval, repeats: true) { [weak self] _ in
-                    Task { @MainActor in self?.advanceMarquee() }
-                }
-                // Common mode so the ticker keeps moving while a menu is open.
-                RunLoop.main.add(timer, forMode: .common)
-                marqueeTimer = timer
-            }
-        } else {
-            marqueeTimer?.invalidate()
-            marqueeTimer = nil
-        }
         renderMarquee()
     }
 
-    private func advanceMarquee() {
-        marqueeStep += 1
-        renderMarquee()
+    private func clearMarquee() {
+        renderedMarquee = nil
+        marqueeText = ""
+        ticker.stop()
+        ticker.removeFromSuperview()
     }
 
     private func renderMarquee() {
         guard let button = statusItem?.button else { return }
-        let scrolling = marqueeIsPlaying && Marquee.scrolls(marqueeText, width: Self.titleWidth)
-        let visible = scrolling
-            ? Marquee.window(marqueeText, width: Self.titleWidth, step: marqueeStep)
-            : Marquee.parked(marqueeText, width: Self.titleWidth)
-        // A title that fits takes only the space it needs; a scrolling one gets
-        // a fixed width so the items beside it do not shuffle on every frame.
-        statusItem.length = scrolling ? Self.scrollingItemWidth : NSStatusItem.variableLength
-        button.attributedTitle = NSAttributedString(string: " " + visible, attributes: [
-            .font: Self.titleFont,
-            .foregroundColor: marqueeIsPlaying ? NSColor.labelColor : NSColor.secondaryLabelColor
+        let reduceMotion = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+        let scrolling = marqueeIsPlaying && !reduceMotion
+            && Marquee.scrolls(marqueeText, width: Self.titleWidth)
+        statusItem.length = NSStatusItem.variableLength
+        button.setAccessibilityTitle(marqueeText)
+
+        guard scrolling else {
+            ticker.stop()
+            ticker.removeFromSuperview()
+            let visible = Marquee.parked(marqueeText, width: Self.titleWidth)
+            button.attributedTitle = NSAttributedString(string: " " + visible, attributes: [
+                .font: Self.titleFont,
+                .foregroundColor: marqueeIsPlaying ? NSColor.labelColor : NSColor.secondaryLabelColor
+            ])
+            return
+        }
+
+        // An invisible stand-in of fixed width reserves the room, so the item
+        // keeps a constant size and the icon stays drawn by AppKit; the ticker
+        // then scrolls over exactly the space the title would occupy.
+        let room = " " + String(repeating: "あ", count: Self.titleWidth)
+        button.attributedTitle = NSAttributedString(string: room, attributes: [
+            .font: Self.titleFont, .foregroundColor: NSColor.clear
         ])
+        if ticker.superview !== button { button.addSubview(ticker) }
+        positionTicker()
+        ticker.show(marqueeText, font: Self.titleFont)
+    }
+
+    /// Puts the ticker exactly over the space the title would take. Called
+    /// again whenever the button is resized: the menu bar settles an item's
+    /// width after the title changes, and a ticker placed against the old
+    /// bounds would sit in the wrong spot until the next song.
+    private func positionTicker() {
+        guard let button = statusItem?.button, ticker.superview === button else { return }
+        button.layoutSubtreeIfNeeded()
+        var rect = button.cell?.titleRect(forBounds: button.bounds) ?? button.bounds
+        // Start where a static title's first character would, after its space.
+        let space = ceil((" " as NSString).size(withAttributes: [.font: Self.titleFont]).width)
+        rect.origin.x += space
+        rect.size.width -= space
+        let target = rect.integral
+        if ticker.frame != target { ticker.frame = target }
     }
 
     private func updateStatusTitle(_ snapshot: NowPlaying) {
         guard let button = statusItem?.button else { return }
         guard let track = snapshot.track, snapshot.state != .stopped else {
-            marqueeTimer?.invalidate()
-            marqueeTimer = nil
-            marqueeText = ""
+            clearMarquee()
             button.attributedTitle = NSAttributedString(string: "")
             button.imagePosition = .imageOnly
             statusItem.length = NSStatusItem.squareLength
@@ -129,6 +139,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             button.action = #selector(statusItemClicked(_:))
             button.sendAction(on: [.leftMouseUp, .rightMouseUp])
         }
+        if let button = statusItem.button {
+            button.postsFrameChangedNotifications = true
+            NotificationCenter.default.addObserver(forName: NSView.frameDidChangeNotification,
+                                                   object: button, queue: .main) { [weak self] _ in
+                MainActor.assumeIsolated { self?.positionTicker() }
+            }
+        }
+
         // Next / previous on the keyboard walk this app's queue while it is in
         // charge; otherwise the keys go to Music as usual.
         mediaKeys.shouldIntercept = { [weak self] in self?.player.owns ?? false }
@@ -170,8 +188,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationWillTerminate(_ notification: Notification) {
         mediaKeys.stop()
-        marqueeTimer?.invalidate()
-        marqueeTimer = nil
+        clearMarquee()
         dismissPanel()
         NotificationCenter.default.removeObserver(self)
         player?.shutdown()
