@@ -360,7 +360,9 @@ enum MusicBridge {
             -- Bulk property access throws on an empty playlist: `every track`
             -- returns {} but `database ID of every track` fails. Answer with
             -- empty lists so an empty (often smart) playlist is not an error.
-            set mqPL to (first user playlist whose persistent ID is "\(pid)")
+            -- `playlist`, not `user playlist`: a folder is neither, and asking
+            -- for it as a user playlist throws rather than coming back empty.
+            set mqPL to (first playlist whose persistent ID is "\(pid)")
             if (count of tracks of mqPL) is 0 then
                 set mqIDs to {}
                 set mqNames to {}

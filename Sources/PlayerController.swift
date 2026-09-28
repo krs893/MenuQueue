@@ -32,7 +32,12 @@ final class PlayerController: ObservableObject {
     private var shuffleRequestVersion = 0
     var isShuffleChanging: Bool { requestedShuffle != nil }
 
-    @Published var gaplessTakeover: Bool = UserDefaults.standard.object(forKey: "gaplessTakeover") as? Bool ?? true {
+    /// Borrow Music's repeat-one while the queue drives playback. Off by
+    /// default: Music resets the repeat mode whenever a track is started, so
+    /// the borrow did not reliably take, and when it did it was a change to
+    /// the user's own setting. The queue no longer needs it — the next track is
+    /// handed over just before the current one ends (see `handoffLead`).
+    @Published var gaplessTakeover: Bool = UserDefaults.standard.object(forKey: "gaplessTakeover") as? Bool ?? false {
         didSet {
             UserDefaults.standard.set(gaplessTakeover, forKey: "gaplessTakeover")
             Task {
@@ -168,6 +173,17 @@ final class PlayerController: ObservableObject {
         pollInterval = computeInterval(np)
     }
 
+    /// How long before the end of a track the next one is handed to Music.
+    ///
+    /// What Music does at the end of a single track started from a script
+    /// depends on the user's repeat mode and on whatever is left in Music's own
+    /// queue: it may stop, loop, or wander off. Getting in first avoids all of
+    /// that. The window has to be wider than one poll plus one AppleScript
+    /// round trip, or a poll can land either side of it and miss — at 0.15 s
+    /// it did, on a real track with repeat set to "all". The cost is at most
+    /// half a second of the tail, which is nearly always fade or silence.
+    static let handoffLead: Double = 0.5
+
     private func computeInterval(_ np: NowPlaying) -> Double {
         guard np.state.isPlaying else { return 2.0 }
         guard owns, let d = np.track?.duration, d > 0 else { return 1.0 }
@@ -191,7 +207,7 @@ final class PlayerController: ObservableObject {
         }
         guard let d = np.track?.duration, d > 0, np.state.isPlaying else { return }
         let remaining = d - np.position
-        if remaining <= 0.15 {
+        if remaining <= Self.handoffLead {
             await advance(automatically: true)
             return
         }
@@ -215,7 +231,7 @@ final class PlayerController: ObservableObject {
         revision += 1
         defer { transitioning = false }
         lastError = nil
-        await applyRepeatOne()
+        await rememberUserRepeat()
         let dbID = item.track.databaseID
         let playlistID = item.track.sourcePlaylistID
         let ok = await bridge({ try MusicBridge.play(databaseID: dbID, playlistID: playlistID) })
@@ -224,6 +240,8 @@ final class PlayerController: ObservableObject {
             await releaseOwnership()
             return
         }
+        // After the play, which has just reset the repeat mode to off.
+        await applyRepeatOne()
         _ = store.select(item.id)
         expectedDBID = dbID
         expectedUntil = Date().addingTimeInterval(3)
@@ -253,6 +271,23 @@ final class PlayerController: ObservableObject {
         }
     }
 
+    /// Picking a track out of a playlist should carry on through the rest of it.
+    ///
+    /// Music cannot be made to do that from a script. Playing a single track
+    /// drops the playlist context — `current playlist` comes back unset and
+    /// `next track` just restarts the same song — and `play <playlist>`, which
+    /// does keep the context, always starts from the top. Skipping forward from
+    /// the top would reach the right track, but every skipped song would be
+    /// recorded against the user's listening history.
+    ///
+    /// So the playlist becomes this app's queue, starting at the chosen track,
+    /// and the controller hands Music the next one when each ends.
+    func playFromPlaylist(_ tracks: [MusicTrack], startAt index: Int) async {
+        guard tracks.indices.contains(index), !transitioning, !advancing else { return }
+        store.replaceAll(with: tracks)
+        await play(item: store.items[index])
+    }
+
     func startQueueFromTop() async {
         guard let first = store.items.first else { return }
         await play(item: first)
@@ -280,16 +315,26 @@ final class PlayerController: ObservableObject {
         await restoreRepeat()
     }
 
+    /// Records the user's repeat mode so it can be handed back later.
+    ///
+    /// This has to happen before a track is started, and the borrow itself
+    /// after: `play <track>` resets Music's repeat mode to off. Borrowing first
+    /// meant the play immediately undid it, and recording afterwards would
+    /// have remembered that "off" instead of what the user actually had.
+    private func rememberUserRepeat() async {
+        guard gaplessTakeover, savedRepeat == nil else { return }
+        guard let current = await bridge({ try MusicBridge.nowPlaying() }) else { return }
+        // Never record "one" as the mode to go back to: that is the mode
+        // being borrowed, and a leftover entry from an earlier crash would
+        // otherwise make it permanent.
+        savedRepeat = current.repeatMode == "one" ? (pendingRepeatRestore ?? "off") : current.repeatMode
+        pendingRepeatRestore = savedRepeat
+    }
+
     private func applyRepeatOne() async {
         guard gaplessTakeover else { return }
-        if savedRepeat == nil {
-            guard let current = await bridge({ try MusicBridge.nowPlaying() }) else { return }
-            // Never record "one" as the mode to go back to: that is the mode
-            // being borrowed, and a leftover entry from an earlier crash would
-            // otherwise make it permanent.
-            savedRepeat = current.repeatMode == "one" ? (pendingRepeatRestore ?? "off") : current.repeatMode
-            pendingRepeatRestore = savedRepeat
-        }
+        await rememberUserRepeat()
+        guard savedRepeat != nil else { return }
         _ = await bridge({ try MusicBridge.setRepeat("one") })
     }
 

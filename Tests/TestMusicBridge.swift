@@ -72,6 +72,8 @@ enum MusicBridge {
         Thread.sleep(forTimeInterval: delay)
         guard !missing else { return false }
         plays.append(databaseID)
+        // Real Music resets the repeat mode when a track is started.
+        snapshot.repeatMode = "off"
         snapshot.track = MusicTrack(databaseID: databaseID, name: "Track", artist: "", album: "", duration: 100)
         snapshot.position = 0
         snapshot.state = .playing

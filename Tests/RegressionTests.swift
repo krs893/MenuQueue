@@ -4,6 +4,8 @@ import AppKit
 @main
 struct RegressionTests {
     @MainActor static func main() async throws {
+        // Most queue tests exercise repeat borrowing, which is opt-in now.
+        UserDefaults.standard.set(true, forKey: "gaplessTakeover")
         assert(QueueTextParser.firstText(["", "  ", "Song description"]) == "Song description")
         assert(QueueTextParser.firstText(["\u{FFFC} AutoPlay"]) == "AutoPlay")
         for heading in ["再生を続ける", "Continue Playing", "次に再生", "Playing Next", "\u{FFFC} AutoPlay", "Playlist name"] {
@@ -239,6 +241,54 @@ struct RegressionTests {
         model.reconcileFolderPath()
         assert(model.currentFolder == nil && model.visibleEntries.map(\PlaylistInfo.id) == ["P3"])
         print("PASS: playlist folders browse and survive disappearing")
+
+        // Choosing the second song of a playlist plays it and then carries on
+        // through the rest: Music drops the playlist context when a single
+        // track is started from a script, so the app has to do the carrying.
+        MusicBridge.isRunning = true
+        MusicBridge.snapshot = NowPlaying()
+        MusicBridge.snapshot.repeatMode = "all"
+        MusicBridge.plays = []
+        MusicBridge.repeatWrites = []
+        MusicBridge.missing = false
+        UserDefaults.standard.removeObject(forKey: "borrowedRepeatMode")
+        // The shipped default: the user's repeat mode is left alone.
+        UserDefaults.standard.set(false, forKey: "gaplessTakeover")
+        let listDir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: listDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: listDir) }
+        let listStore = QueueStore(fileURL: listDir.appendingPathComponent("list.json"))
+        let lister = PlayerController(store: listStore, startPolling: false)
+        let album = (1...5).map { MusicTrack(databaseID: 100 + $0, name: "s\($0)", artist: "a", album: "b", duration: 100) }
+        await lister.playFromPlaylist(album, startAt: 1)
+        assert(MusicBridge.plays == [102], "the chosen track plays first: \(MusicBridge.plays)")
+        assert(listStore.items.count == 5 && listStore.currentIndex == 1)
+        assert(MusicBridge.repeatWrites.isEmpty,
+               "playing through a playlist must not touch the user's repeat mode: \(MusicBridge.repeatWrites)")
+        assert(UserDefaults.standard.string(forKey: "borrowedRepeatMode") == nil)
+        await lister.advance(automatically: true)
+        assert(MusicBridge.plays == [102, 103], "the next song follows: \(MusicBridge.plays)")
+        // Out-of-range picks are ignored rather than crashing.
+        await lister.playFromPlaylist(album, startAt: 9)
+        await lister.playFromPlaylist([], startAt: 0)
+        assert(MusicBridge.plays == [102, 103])
+        await lister.clearQueue()
+        assert(MusicBridge.repeatWrites.isEmpty, "nothing to hand back, nothing was taken")
+
+        // The hand-off happens early enough that a poll cannot straddle it.
+        MusicBridge.plays = []
+        await lister.playFromPlaylist(album, startAt: 0)
+        MusicBridge.snapshot.position = 100 - PlayerController.handoffLead + 0.05
+        MusicBridge.snapshot.state = .playing
+        await lister.tick()
+        assert(MusicBridge.plays == [101, 102],
+               "within the hand-off window the next track starts: \(MusicBridge.plays)")
+        await lister.clearQueue()
+        UserDefaults.standard.removeObject(forKey: "borrowedRepeatMode")
+        // Back to the setting the remaining tests are written against. Not a
+        // `defer`: that would only run at the end of this whole function.
+        UserDefaults.standard.set(true, forKey: "gaplessTakeover")
+        print("PASS: picking a track plays on through the rest of its playlist")
 
         // A duration that is not a usable number must not reach the UI: it ends
         // up as the upper bound of the progress slider's range.

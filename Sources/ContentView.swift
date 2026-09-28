@@ -34,11 +34,23 @@ struct ContentView: View {
             }
 
             if let err = player.lastError {
-                HStack {
-                    Spacer()
+                // Spelled out rather than hidden in a tooltip: an orange
+                // triangle alone gives no way to tell a missing permission
+                // from a track that could not be found.
+                HStack(alignment: .top, spacing: 6) {
                     Image(systemName: "exclamationmark.triangle.fill")
-                        .foregroundStyle(.orange).help(err).accessibilityLabel(err)
-                }.padding(.horizontal, 12).padding(.bottom, 6)
+                        .foregroundStyle(.orange)
+                        .font(.system(size: 11))
+                    Text(err)
+                        .font(.system(size: 10))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(3)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .textSelection(.enabled)
+                    Spacer(minLength: 0)
+                }
+                .padding(.horizontal, 12).padding(.bottom, 6)
+                .accessibilityLabel(err)
             }
         }
         // Below the panel's own height, so the panel sets the size rather than
@@ -256,7 +268,17 @@ struct LibraryTab: View {
             .padding(.horizontal, 10).padding(.vertical, 6)
             Divider()
             if let error = library.playlistError {
-                Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange).help(error).padding(10)
+                HStack(alignment: .top, spacing: 6) {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .foregroundStyle(.orange).font(.system(size: 11))
+                    Text(error)
+                        .font(.system(size: 10)).foregroundStyle(.secondary)
+                        .lineLimit(3).fixedSize(horizontal: false, vertical: true)
+                        .textSelection(.enabled)
+                    Spacer(minLength: 0)
+                }
+                .padding(.horizontal, 10).padding(.vertical, 6)
+                .accessibilityLabel(error)
             }
             playlistSection
         }
@@ -268,9 +290,17 @@ struct LibraryTab: View {
                 EmptyHint(icon: library.isLoadingTracks ? "hourglass" : "music.note.list",
                           text: library.isLoadingTracks ? "読み込み中…" : "このプレイリストは空です")
             } else {
-                List(library.playlistTracks) { track in
+                // Indexed rather than keyed by track: the row's position is what
+                // says where in the playlist to start, and a playlist can hold
+                // the same song twice.
+                List(Array(library.playlistTracks.enumerated()), id: \.offset) { index, track in
                     TrackPickRow(track: track,
-                                 play: { Task { await player.playNative(track) } },
+                                 isPlaying: player.now.track?.databaseID == track.databaseID
+                                    && player.now.state.isPlaying,
+                                 play: {
+                                     let tracks = library.playlistTracks
+                                     Task { await player.playFromPlaylist(tracks, startAt: index) }
+                                 },
                                  artwork: artwork)
                 }
                 .listStyle(.plain)
@@ -329,6 +359,7 @@ struct ArtworkThumbnail: View {
 
 struct TrackPickRow: View {
     let track: MusicTrack
+    var isPlaying: Bool = false
     let play: () -> Void
     @ObservedObject var artwork: ArtworkStore
 
@@ -341,7 +372,9 @@ struct TrackPickRow: View {
                     Text(track.subtitle).font(.system(size: 12)).foregroundStyle(.secondary).lineLimit(1)
                 }
                 Spacer(minLength: 4)
-                Image(systemName: "play.fill").foregroundStyle(.secondary).frame(width: 32, height: 32)
+                Image(systemName: isPlaying ? "speaker.wave.2.fill" : "play.fill")
+                    .foregroundStyle(isPlaying ? AnyShapeStyle(.tint) : AnyShapeStyle(.secondary))
+                    .frame(width: 32, height: 32)
             }
             .frame(maxWidth: .infinity, minHeight: 48, alignment: .leading)
             .contentShape(Rectangle())
