@@ -16,9 +16,26 @@ final class ScriptRunner {
         var errorDescription: String? { message }
     }
 
+    /// When the call currently running on the queue began, nil when idle.
+    ///
+    /// A single Apple Event that Music never answers blocks this queue for
+    /// good — NSAppleScript waited days on one artwork request, past the
+    /// AppleScript default timeout — and every later call queues up behind
+    /// it. The call itself cannot be cancelled, but the app can at least see
+    /// that it has happened and say so instead of spinning forever.
+    private let inFlightLock = NSLock()
+    private var inFlightSince: Date?
+
+    var stalledSeconds: TimeInterval {
+        inFlightLock.lock(); defer { inFlightLock.unlock() }
+        return inFlightSince.map { Date().timeIntervalSince($0) } ?? 0
+    }
+
     @discardableResult
     func run(_ source: String) throws -> NSAppleEventDescriptor {
         try queue.sync {
+            inFlightLock.lock(); inFlightSince = Date(); inFlightLock.unlock()
+            defer { inFlightLock.lock(); inFlightSince = nil; inFlightLock.unlock() }
             let script: NSAppleScript
             if let cached = cache[source] {
                 script = cached
@@ -132,6 +149,52 @@ enum MusicBridge {
         return np
     }
 
+    /// Runs a script that writes artwork bytes to a file, in a separate
+    /// `osascript` process that is killed if it overruns.
+    ///
+    /// Artwork is the one request Music has been seen to never answer: the
+    /// app sat for days inside `raw data of artwork` on a cloud track, with
+    /// AppleScript's own two-minute timeout never firing. In-process that
+    /// blocked the shared script queue, and with it now-playing, playlists and
+    /// everything else. A child process can simply be killed. The child's
+    /// Apple Events are attributed to this app, so it needs no permission of
+    /// its own.
+    private static func isolatedArtwork(body: String, deadline: TimeInterval = 4) -> NSImage? {
+        let file = FileManager.default.temporaryDirectory
+            .appendingPathComponent("menuqueue-art-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: file) }
+        let script = """
+        set mqData to missing value
+        tell application id "com.apple.Music"
+            with timeout of 3 seconds
+                \(body)
+            end timeout
+        end tell
+        if mqData is missing value then return "none"
+        set mqFile to open for access (POSIX file "\(file.path)") with write permission
+        try
+            write mqData to mqFile
+        end try
+        close access mqFile
+        return "ok"
+        """
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+        process.arguments = ["-e", script]
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
+        do { try process.run() } catch { return nil }
+        let until = Date().addingTimeInterval(deadline)
+        while process.isRunning && Date() < until { usleep(20_000) }
+        if process.isRunning {
+            kill(process.processIdentifier, SIGKILL)
+            process.waitUntilExit()
+            return nil
+        }
+        guard let data = try? Data(contentsOf: file), data.count > 16 else { return nil }
+        return NSImage(data: data)
+    }
+
     /// Artwork for a specific library track. Resolved the same way playback is:
     /// cloud tracks only exist inside their own playlist, never in the library
     /// playlist, so the container has to come with the id.
@@ -139,39 +202,24 @@ enum MusicBridge {
         let pid = esc(playlistID ?? "")
         let container = playlistID == nil
             ? "library playlist 1"
-            : "(first user playlist whose persistent ID is \"\(pid)\")"
-        let src = """
-        tell application id "com.apple.Music"
+            : "(first playlist whose persistent ID is \"\(pid)\")"
+        return isolatedArtwork(body: """
             try
-                set mqMatches to (every track of \(container) whose database ID is \(databaseID))
-                if mqMatches is {} then return missing value
-                return raw data of artwork 1 of (item 1 of mqMatches)
-            on error
-                return missing value
-            end try
-        end tell
-        """
-        guard let desc = try? ScriptRunner.shared.run(src) else { return nil }
-        let data = desc.data
-        guard data.count > 16 else { return nil }
-        return NSImage(data: data)
+                    set mqMatches to (every track of \(container) whose database ID is \(databaseID))
+                    if mqMatches is not {} then set mqData to raw data of artwork 1 of (item 1 of mqMatches)
+                end try
+            """)
     }
 
     static func artworkOfCurrentTrack() -> NSImage? {
         guard isRunning else { return nil }
-        let src = """
-        tell application id "com.apple.Music"
+        // Same isolation: this one runs inside the now-playing poll, so a hang
+        // here used to stop the menu bar from ever updating again.
+        return isolatedArtwork(body: """
             try
-                return raw data of artwork 1 of current track
-            on error
-                return missing value
-            end try
-        end tell
-        """
-        guard let desc = try? ScriptRunner.shared.run(src) else { return nil }
-        let data = desc.data
-        guard data.count > 16 else { return nil }
-        return NSImage(data: data)
+                    set mqData to raw data of artwork 1 of current track
+                end try
+            """)
     }
 
     // MARK: Transport

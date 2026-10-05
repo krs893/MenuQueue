@@ -23,6 +23,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var playerWindow: NSWindow?
     private var cancellables = Set<AnyCancellable>()
     private let mediaKeys = MediaKeyTap()
+    private var stallWatch: Timer?
+    private static let stallMessage = "ミュージックからの応答が止まっています。メニューバーを右クリックして MenuQueue を終了し、開き直してください"
+
+    private func checkForStall() {
+        let stalled = ScriptRunner.shared.stalledSeconds > 20
+        if stalled, player.lastError != Self.stallMessage {
+            player.lastError = Self.stallMessage
+        } else if !stalled, player.lastError == Self.stallMessage {
+            player.lastError = nil
+        }
+    }
 
     /// Menu bar space is shared with every other app — the user wants room for
     /// other status items — so the width is a constant and long titles scroll
@@ -145,6 +156,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                                                    object: button, queue: .main) { [weak self] _ in
                 MainActor.assumeIsolated { self?.positionTicker() }
             }
+        }
+
+        // A call into Music that never comes back cannot be cancelled, but it
+        // must not be left looking like a slow load. Say what happened.
+        stallWatch = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated { self?.checkForStall() }
         }
 
         // Next / previous on the keyboard walk this app's queue while it is in

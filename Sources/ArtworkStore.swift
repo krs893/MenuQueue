@@ -24,6 +24,12 @@ final class ArtworkStore: ObservableObject {
     /// Points; the bitmap is rendered at twice this for Retina.
     static let side: CGFloat = 36
 
+    /// One fetch at a time, off the Swift concurrency pool. Each fetch is a
+    /// short-lived `osascript` process that waits on Music, and a screenful of
+    /// rows starting a dozen of those at once — or parking a dozen cooperative
+    /// threads in a wait — helps nothing.
+    private static let fetchQueue = DispatchQueue(label: "jp.menuqueue.artwork", qos: .utility)
+
     /// Art belongs to an album, not a track. Tracks with no album fall back to
     /// their own id so they still get a picture rather than sharing a blank key.
     nonisolated static func key(_ track: MusicTrack) -> String {
@@ -45,10 +51,14 @@ final class ArtworkStore: ObservableObject {
         let dbID = track.databaseID
         let playlistID = track.sourcePlaylistID
         let side = Self.side
-        let thumbnail = await Task.detached(priority: .utility) { () -> NSImage? in
-            guard let full = MusicBridge.artwork(databaseID: dbID, playlistID: playlistID) else { return nil }
-            return ArtworkStore.downscale(full, to: side)
-        }.value
+        let thumbnail = await withCheckedContinuation { (done: CheckedContinuation<NSImage?, Never>) in
+            Self.fetchQueue.async {
+                guard let full = MusicBridge.artwork(databaseID: dbID, playlistID: playlistID) else {
+                    return done.resume(returning: nil)
+                }
+                done.resume(returning: ArtworkStore.downscale(full, to: side))
+            }
+        }
 
         if let thumbnail {
             thumbnails[key] = thumbnail
