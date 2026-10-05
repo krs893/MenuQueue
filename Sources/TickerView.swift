@@ -114,6 +114,9 @@ final class TickerView: NSView {
 
         NSGraphicsContext.saveGraphicsState()
         NSGraphicsContext.current = context
+        // Bitmap contexts use pixels even when rep.size is expressed in points.
+        // Match the layer's backing scale so a 12 pt title stays 12 pt on Retina.
+        context.cgContext.scaleBy(x: scale, y: scale)
         // Resolve labelColor against the menu bar's own appearance, not the
         // app's, or the text comes out dark on a dark bar.
         effectiveAppearance.performAsCurrentDrawingAppearance {

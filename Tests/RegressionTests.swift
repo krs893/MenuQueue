@@ -4,6 +4,41 @@ import AppKit
 @main
 struct RegressionTests {
     @MainActor static func main() async throws {
+        let shuffleLibrary = LibraryModel()
+        let root = PlaylistInfo(id: "root", name: "Folder", count: 0, isFolder: true)
+        let shuffleNested = PlaylistInfo(id: "nested", name: "Nested", count: 0, parentID: "root", isFolder: true)
+        let a = PlaylistInfo(id: "a", name: "A", count: 2, parentID: "root")
+        let b = PlaylistInfo(id: "b", name: "B", count: 2, parentID: "nested")
+        let outside = PlaylistInfo(id: "outside", name: "Outside", count: 1)
+        shuffleLibrary.playlists = [root, shuffleNested, a, b, outside]
+        assert(Set(shuffleLibrary.playbackPlaylists(in: root).map(\.id)) == ["a", "b"])
+        assert(shuffleLibrary.playbackPlaylists(in: a).map(\.id) == ["a"])
+        func song(_ id: Int) -> MusicTrack {
+            MusicTrack(databaseID: id, name: "Song", artist: "", album: "", duration: 100)
+        }
+        MusicBridge.stubTracks = ["a": [song(1), song(2)], "b": [song(2), song(3)], "outside": [song(4)]]
+        let shuffleURL = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: shuffleURL) }
+        let shuffleStore = QueueStore(fileURL: shuffleURL)
+        let shufflePlayer = PlayerController(store: shuffleStore, startPolling: false)
+        await shuffleLibrary.shufflePlay(root, player: shufflePlayer)
+        assert(shuffleStore.shuffleActive && shufflePlayer.owns)
+        assert(shuffleStore.items.count == 3)
+        assert(Set(shuffleStore.items.map { $0.track.databaseID }) == [1, 2, 3])
+        assert(shuffleStore.items.allSatisfy { ["a", "b"].contains($0.track.sourcePlaylistID ?? "") })
+        assert(shuffleStore.currentID == shuffleStore.items.first?.id)
+        await shuffleLibrary.shufflePlay(a, player: shufflePlayer)
+        assert(Set(shuffleStore.items.map { $0.track.databaseID }) == [1, 2])
+        let beforeEmpty = shuffleStore.items
+        MusicBridge.stubTracks = [:]
+        await shuffleLibrary.shufflePlay(a, player: shufflePlayer)
+        assert(shuffleStore.items == beforeEmpty && shuffleLibrary.playlistError != nil)
+        await shufflePlayer.clearQueue()
+        MusicBridge.plays = []
+        MusicBridge.repeatWrites = []
+        MusicBridge.snapshot = NowPlaying()
+        print("PASS: scoped shuffle, nested folders, duplicate songs, source context, and empty preservation")
+
         // Most queue tests exercise repeat borrowing, which is opt-in now.
         UserDefaults.standard.set(true, forKey: "gaplessTakeover")
         assert(QueueTextParser.firstText(["", "  ", "Song description"]) == "Song description")
@@ -175,6 +210,23 @@ struct RegressionTests {
         assert(Marquee.window(long, width: 0, step: 3).isEmpty)
         assert(!Marquee.scrolls(long, width: 0))
         print("PASS: the menu bar ticker keeps a constant width and loops cleanly")
+        let tickerView = TickerView(frame: NSRect(x: 0, y: 0, width: 120, height: 22))
+        tickerView.show("MMMMMMMMMMMMMMMM", font: NSFont.systemFont(ofSize: 12))
+        let tickerImage = tickerView.layer!.sublayers!.first!.contents as! CGImage
+        let tickerBitmap = NSBitmapImageRep(cgImage: tickerImage)
+        var lastInkX = 0
+        for x in 0..<tickerBitmap.pixelsWide {
+            for y in 0..<tickerBitmap.pixelsHigh {
+                if (tickerBitmap.colorAt(x: x, y: y)?.alphaComponent ?? 0) > 0.1 {
+                    lastInkX = x
+                    break
+                }
+            }
+        }
+        assert(Double(lastInkX) > Double(tickerBitmap.pixelsWide) * 0.9,
+               "Scrolling title must fill its point-sized strip without Retina shrinkage")
+        tickerView.stop()
+        print("PASS: scrolling title bitmap preserves fixed font size at display scale")
 
         // Album art is cached per album, not per track: a playlist of 271 songs
         // spanned 84 albums here, so keying by track would fetch three times

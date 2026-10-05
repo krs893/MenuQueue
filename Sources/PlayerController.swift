@@ -288,6 +288,13 @@ final class PlayerController: ObservableObject {
         await play(item: store.items[index])
     }
 
+    func playShuffled(_ tracks: [MusicTrack]) async {
+        guard !tracks.isEmpty, !transitioning, !advancing else { return }
+        store.replaceAll(with: tracks)
+        store.setShuffle(true)
+        await startQueueFromTop()
+    }
+
     func startQueueFromTop() async {
         guard let first = store.items.first else { return }
         await play(item: first)

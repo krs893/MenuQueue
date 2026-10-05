@@ -59,6 +59,53 @@ final class LibraryModel: ObservableObject {
         if let selected = selectedPlaylist { loadTracks(of: selected) }
     }
 
+    @Published private(set) var isPreparingShuffle = false
+
+    /// Walk descendants once, including nested folders but excluding siblings.
+    func playbackPlaylists(in entry: PlaylistInfo) -> [PlaylistInfo] {
+        var visited = Set<String>()
+        func walk(_ item: PlaylistInfo) -> [PlaylistInfo] {
+            guard visited.insert(item.id).inserted else { return [] }
+            if !item.isFolder { return [item] }
+            return playlists.filter { $0.parentID == item.id }.flatMap { walk($0) }
+        }
+        return walk(entry)
+    }
+
+    func shufflePlay(_ entry: PlaylistInfo, player: PlayerController) async {
+        guard !isPreparingShuffle else { return }
+        isPreparingShuffle = true
+        playlistError = nil
+        defer { isPreparingShuffle = false }
+        let sources = playbackPlaylists(in: entry)
+        let outcome = await Task.detached(priority: .userInitiated) {
+            Result { () throws -> [MusicTrack] in
+                var tracks: [MusicTrack] = []
+                var seen = Set<Int>()
+                for source in sources {
+                    for var track in try MusicBridge.tracks(inPlaylist: source.id) {
+                        track.sourcePlaylistID = source.id
+                        // A song present in several child playlists plays only once.
+                        if !entry.isFolder || seen.insert(track.databaseID).inserted {
+                            tracks.append(track)
+                        }
+                    }
+                }
+                return tracks
+            }
+        }.value
+        switch outcome {
+        case .success(let tracks):
+            guard !tracks.isEmpty else {
+                playlistError = "シャッフル再生できる曲がありません"
+                return
+            }
+            await player.playShuffled(tracks)
+        case .failure(let error):
+            playlistError = error.localizedDescription
+        }
+    }
+
     func loadPlaylists() {
         guard !isLoadingPlaylists else { return }
         isLoadingPlaylists = true

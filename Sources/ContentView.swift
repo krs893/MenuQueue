@@ -1,4 +1,5 @@
 import SwiftUI
+import Combine
 import AppKit
 import ServiceManagement
 
@@ -262,6 +263,9 @@ struct LibraryTab: View {
                 .help("ライブラリを読み直す")
                 .accessibilityLabel("ライブラリを読み直す")
                 .disabled(library.isLoadingPlaylists || library.isLoadingTracks)
+                if let entry = library.selectedPlaylist ?? library.currentFolder {
+                    shuffleButton(for: entry)
+                }
             }
             .buttonStyle(.borderless)
             .fixedSize(horizontal: false, vertical: true)
@@ -282,6 +286,28 @@ struct LibraryTab: View {
             }
             playlistSection
         }
+    }
+
+    private func shuffleButton(for entry: PlaylistInfo) -> some View {
+        Button {
+            Task { await library.shufflePlay(entry, player: player) }
+        } label: {
+            Group {
+                if library.isPreparingShuffle {
+                    ProgressView().controlSize(.small)
+                } else {
+                    Image(systemName: "shuffle")
+                        .font(.system(size: 14, weight: .semibold))
+                        .symbolRenderingMode(.hierarchical)
+                }
+            }
+            .frame(width: controlSize, height: controlSize)
+            .contentShape(Circle())
+        }
+        .buttonStyle(ShufflePlayButtonStyle())
+        .disabled(library.isPreparingShuffle)
+        .help(entry.isFolder ? "子フォルダを含む全曲をシャッフル再生" : "プレイリストをシャッフル再生")
+        .accessibilityLabel("\(entry.name)をシャッフル再生")
     }
 
     @ViewBuilder private var playlistSection: some View {
@@ -333,6 +359,26 @@ struct LibraryTab: View {
             }
             .listStyle(.plain)
         }
+    }
+}
+
+private struct ShufflePlayButtonStyle: ButtonStyle {
+    @Environment(\.isEnabled) private var isEnabled
+    @State private var isHovered = false
+
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .foregroundStyle(Color.primary.opacity(isEnabled ? 0.9 : 0.35))
+            .background {
+                Circle().fill(Color.primary.opacity(configuration.isPressed ? 0.16 : isHovered ? 0.11 : 0.06))
+            }
+            .overlay {
+                Circle().strokeBorder(Color.primary.opacity(0.08), lineWidth: 0.5)
+            }
+            .scaleEffect(configuration.isPressed ? 0.94 : 1)
+            .animation(.easeOut(duration: 0.14), value: configuration.isPressed)
+            .animation(.easeOut(duration: 0.14), value: isHovered)
+            .onHover { isHovered = $0 }
     }
 }
 
