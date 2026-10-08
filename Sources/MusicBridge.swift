@@ -101,51 +101,119 @@ enum MusicBridge {
 
     // MARK: Reading state
 
+    // MARK: Now playing, cheaply
+    //
+    // Music takes about 35 ms to answer each Apple Event, and the old query
+    // asked a dozen questions every poll — around 300 ms, polled up to ten
+    // times a second near the end of a track. Most of those answers do not
+    // change from one poll to the next. So each poll now asks only what does
+    // (state, track id, position); the track's name, artist, album and length
+    // are fetched when the id changes, and the player settings every third poll
+    // or straight after this app changes one.
+
+    private static let cacheLock = NSLock()
+    private static var cachedTrack: MusicTrack?
+    private static var cachedSettings: (shuffle: Bool, repeatMode: String, volume: Int, muted: Bool)?
+    private static var pollsSinceSettings = 0
+
+    /// Called after this app writes a setting, so the next poll reads it back.
+    static func invalidateSettings() {
+        cacheLock.lock(); cachedSettings = nil; cacheLock.unlock()
+    }
+
+    private static let coreQuery = joinHandler + """
+    tell application id "com.apple.Music"
+        set mqState to (player state as text)
+        set mqID to "0"
+        set mqPos to "0"
+        try
+            set mqID to ((database ID of current track) as text)
+        end try
+        try
+            set mqPos to ((player position) as text)
+        end try
+    end tell
+    return my joinList({mqState, mqID, mqPos})
+    """
+
+    private static let trackQuery = joinHandler + """
+    tell application id "com.apple.Music"
+        set mqID to "0"
+        set mqName to ""
+        set mqArtist to ""
+        set mqAlbum to ""
+        set mqDur to "0"
+        try
+            set mqTrack to current track
+            set mqID to ((database ID of mqTrack) as text)
+            set mqName to (name of mqTrack)
+            set mqArtist to (artist of mqTrack)
+            set mqAlbum to (album of mqTrack)
+            set mqDur to ((duration of mqTrack) as text)
+        end try
+    end tell
+    return my joinList({mqID, mqName, mqArtist, mqAlbum, mqDur})
+    """
+
+    private static let settingsQuery = joinHandler + """
+    tell application id "com.apple.Music"
+        set mqShuffle to ((shuffle enabled) as text)
+        set mqRepeat to ((song repeat) as text)
+        set mqVol to ((sound volume) as text)
+        set mqMute to ((mute) as text)
+    end tell
+    return my joinList({mqShuffle, mqRepeat, mqVol, mqMute})
+    """
+
     static func nowPlaying() throws -> NowPlaying {
         guard isRunning else { return NowPlaying() }
-        let src = joinHandler + """
-        tell application id "com.apple.Music"
-            set mqState to (player state as text)
-            set mqID to "0"
-            set mqName to ""
-            set mqArtist to ""
-            set mqAlbum to ""
-            set mqDur to "0"
-            set mqPos to "0"
-            try
-                set mqTrack to current track
-                set mqID to ((database ID of mqTrack) as text)
-                set mqName to (name of mqTrack)
-                set mqArtist to (artist of mqTrack)
-                set mqAlbum to (album of mqTrack)
-                set mqDur to ((duration of mqTrack) as text)
-            end try
-            try
-                set mqPos to ((player position) as text)
-            end try
-            set mqShuffle to ((shuffle enabled) as text)
-            set mqRepeat to ((song repeat) as text)
-            set mqVol to ((sound volume) as text)
-            set mqMute to ((mute) as text)
-        end tell
-        return my joinList({mqState, mqID, mqName, mqArtist, mqAlbum, mqDur, mqPos, mqShuffle, mqRepeat, mqVol, mqMute})
-        """
-        let raw = try ScriptRunner.shared.string(src)
-        let f = raw.components(separatedBy: RS)
-        guard f.count >= 10 else { return NowPlaying() }
+        let core = try ScriptRunner.shared.string(coreQuery).components(separatedBy: RS)
+        guard core.count >= 3 else { return NowPlaying() }
 
         var np = NowPlaying()
-        np.state = PlayerState(appleScript: f[0])
-        let dbID = Int(f[1]) ?? 0
-        if dbID != 0 {
-            np.track = MusicTrack(databaseID: dbID, name: f[2], artist: f[3],
-                                  album: f[4], duration: number(f[5]))
+        np.state = PlayerState(appleScript: core[0])
+        let dbID = Int(core[1]) ?? 0
+        np.position = number(core[2])
+
+        cacheLock.lock()
+        var track = cachedTrack
+        var settings = cachedSettings
+        pollsSinceSettings += 1
+        let settingsDue = settings == nil || pollsSinceSettings >= 3
+        cacheLock.unlock()
+
+        if dbID == 0 {
+            track = nil
+        } else if track?.databaseID != dbID {
+            let f = try ScriptRunner.shared.string(trackQuery).components(separatedBy: RS)
+            // The track can change between the two queries; only keep details
+            // that belong to the id this poll is reporting.
+            if f.count >= 5, Int(f[0]) == dbID {
+                track = MusicTrack(databaseID: dbID, name: f[1], artist: f[2],
+                                   album: f[3], duration: number(f[4]))
+            } else {
+                track = MusicTrack(databaseID: dbID, name: "", artist: "", album: "", duration: 0)
+            }
         }
-        np.position = number(f[6])
-        np.shuffle = (f[7] == "true")
-        np.repeatMode = f[8]
-        np.volume = Int(Double(f[9]) ?? 100)
-        np.muted = f.count > 10 && f[10] == "true"
+        if settingsDue {
+            let f = try ScriptRunner.shared.string(settingsQuery).components(separatedBy: RS)
+            if f.count >= 4 {
+                settings = (f[0] == "true", f[1], Int(Double(f[2]) ?? 100), f[3] == "true")
+            }
+        }
+
+        cacheLock.lock()
+        if let track, !track.name.isEmpty { cachedTrack = track } else if dbID == 0 { cachedTrack = nil }
+        if settingsDue, let settings { cachedSettings = settings; pollsSinceSettings = 0 }
+        cacheLock.unlock()
+
+        np.track = track
+        if let settings {
+            np.shuffle = settings.shuffle
+            np.repeatMode = settings.repeatMode
+            np.volume = settings.volume
+            np.muted = settings.muted
+        }
         return np
     }
 
@@ -239,13 +307,16 @@ enum MusicBridge {
         try tellMusic("set player position to \(seconds)")
     }
     static func setVolume(_ v: Int) throws {
+        defer { invalidateSettings() }
         try tellMusic("set sound volume to \(max(0, min(100, v)))")
     }
     static func setShuffle(_ on: Bool) throws {
+        defer { invalidateSettings() }
         try tellMusic("set shuffle enabled to \(on)")
     }
     /// mode: off | one | all
     static func setRepeat(_ mode: String) throws {
+        defer { invalidateSettings() }
         try tellMusic("set song repeat to \(mode)")
     }
 

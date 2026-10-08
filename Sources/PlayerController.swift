@@ -70,6 +70,27 @@ final class PlayerController: ObservableObject {
     private var polling = false
     private var revision = 0
     private var expectedUntil: Date?
+
+    /// Injected so tests can move time forward without sleeping.
+    var clock: () -> Date = { Date() }
+
+    /// When the current queue track was handed to Music.
+    private var startedAt: Date?
+    /// Whether the current queue track is known to be the one actually
+    /// playing. Until then nothing may advance the queue automatically.
+    ///
+    /// Right after a track is started Music answers with a mix of old and new:
+    /// one sample 392 ms after `play` had the previous song's name with the
+    /// new song's position. The reverse mix — the new name with the old song's
+    /// near-the-end position — reads as "this track is about to finish", and
+    /// the engine used to act on it at once and skip the song the user had
+    /// just picked. So a track is only trusted once it is seen by id with its
+    /// position actually moving forward, not near the end.
+    private var confirmed = false
+    private var confirmPosition: Double?
+    /// The scheduled hand-off to the next track; see `scheduleHandoff`.
+    private var handoffTask: Task<Void, Never>?
+    private var handoffAt: Date?
     private var observer: NSObjectProtocol?
 
     var displayedRepeat: String { owns ? (savedRepeat ?? now.repeatMode) : now.repeatMode }
@@ -136,6 +157,9 @@ final class PlayerController: ObservableObject {
             artwork = nil
             artworkDBID = nil
             pollInterval = 3.0
+            if owns { EventLog.shared.note("release  Music quit") }
+            cancelHandoff()
+            confirmed = false
             owns = false
             expectedDBID = nil
             // Only the in-memory copy goes; pendingRepeatRestore survives so
@@ -184,37 +208,120 @@ final class PlayerController: ObservableObject {
     /// half a second of the tail, which is nearly always fade or silence.
     static let handoffLead: Double = 0.5
 
+    /// One poll a second is plenty now that the hand-off is timed locally.
+    ///
+    /// The engine used to poll every 100 ms in the last seconds of a track to
+    /// catch the end. But every poll is a dozen Apple Events and Music takes
+    /// about 35 ms to answer each, so that was Music being asked something
+    /// thirty-odd times a second near the end of every song — enough to make
+    /// playback stumble — while each answer was already 200 ms stale.
     private func computeInterval(_ np: NowPlaying) -> Double {
         guard np.state.isPlaying else { return 2.0 }
-        guard owns, let d = np.track?.duration, d > 0 else { return 1.0 }
-        let remaining = d - np.position
-        if remaining <= 4 { return 0.1 }
-        if remaining <= 15 { return 0.5 }
-        return 1.0
+        guard owns else { return 1.0 }
+        return confirmed ? 1.0 : 0.5
     }
 
     private func evaluateAdvance(_ np: NowPlaying, previousState: PlayerState) async {
-        // Music jumped to a track we did not ask for: release the queue.
-        if let t = np.track, let expected = expectedDBID, t.databaseID != expected {
-            if let expectedUntil, Date() < expectedUntil { return }
-            await releaseOwnership()
+        let now = clock()
+        let sinceStart = startedAt.map { now.timeIntervalSince($0) } ?? .infinity
+
+        // A track other than ours, or nothing at all.
+        if np.track?.databaseID != expectedDBID {
+            if !confirmed {
+                // Still switching over: Music reports the previous song for a
+                // moment. Only give up if ours never turns up.
+                if let expectedUntil, now < expectedUntil { return }
+                await releaseOwnership("Music never started the queued track")
+                return
+            }
+            if np.track == nil, np.state == .stopped {
+                // Music reached the end of our track before the hand-off fired.
+                EventLog.shared.note("advance  ended before hand-off (stopped)")
+                await advance(automatically: true)
+                return
+            }
+            // Something else is playing: the user changed it in Music itself.
+            await releaseOwnership("Music moved to another track (\(np.track?.name ?? "none"))")
             return
         }
-        if np.track?.databaseID == expectedDBID { expectedUntil = nil }
-        if np.state == .stopped && previousState.isPlaying {
-            await advance(automatically: true)
-            return
-        }
-        guard let d = np.track?.duration, d > 0, np.state.isPlaying else { return }
+
+        guard let d = np.track?.duration, d > 0 else { return }
         let remaining = d - np.position
-        if remaining <= Self.handoffLead {
-            await advance(automatically: true)
-            return
+
+        if !confirmed {
+            EventLog.shared.note(String(format: "poll   unconfirmed  pos=%.2f rem=%.2f first=%@ state=%@",
+                                        np.position, remaining,
+                                        confirmPosition.map { String(format: "%.2f", $0) } ?? "nil",
+                                        "\(np.state)"))
+            // Ours by id. Trust it once the position is seen to move forward
+            // from a believable starting point — not a stale reading left over
+            // from the end of the previous song.
+            if let first = confirmPosition, np.position > first + 0.2, remaining > 3 {
+                confirmed = true
+                expectedUntil = nil
+                EventLog.shared.note(String(format: "confirm  playing at %.1fs (%.1fs after start)", np.position, sinceStart))
+            } else if remaining > 3 {
+                confirmPosition = np.position
+            }
+            if !confirmed { return }
         }
-        // Repeat-one looped us back to the top: the track finished.
-        if lastPosition > 2, np.position < lastPosition - 2, (d - lastPosition) < 2.5 {
-            await advance(automatically: true)
+
+        switch np.state {
+        case .playing, .fastForwarding, .rewinding:
+            // Repeat-one (or Music on its own) looped our track back to the top:
+            // treat it as finished.
+            if lastPosition > 2, np.position < lastPosition - 2, (d - lastPosition) < 3 {
+                EventLog.shared.note("advance  track looped")
+                await advance(automatically: true)
+                return
+            }
+            if remaining <= Self.handoffLead {
+                EventLog.shared.note(String(format: "advance  %.2fs left at poll", remaining))
+                await advance(automatically: true)
+                return
+            }
+            scheduleHandoff(after: remaining - Self.handoffLead)
+        case .stopped:
+            if previousState.isPlaying {
+                EventLog.shared.note("advance  ended before hand-off (stopped)")
+                await advance(automatically: true)
+            }
+        default:
+            // Paused: the clock has stopped, so must the hand-off.
+            cancelHandoff()
         }
+    }
+
+    /// Hands the next track to Music just before this one ends.
+    ///
+    /// Timed on this side from the last position Music reported, and re-timed
+    /// on every poll, so a pause, a seek or drift is corrected within a second.
+    /// That replaces catching the end by polling fast, which both hammered
+    /// Music and still read positions a fifth of a second old.
+    private func scheduleHandoff(after delay: TimeInterval) {
+        let at = clock().addingTimeInterval(max(delay, 0))
+        // Re-arming every second for the same moment is pointless churn.
+        if let handoffAt, abs(handoffAt.timeIntervalSince(at)) < 0.25, handoffTask != nil { return }
+        handoffTask?.cancel()
+        handoffAt = at
+        EventLog.shared.note(String(format: "timer  hand-off in %.2fs", delay))
+        let expected = expectedDBID
+        handoffTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: UInt64(max(delay, 0) * 1_000_000_000))
+            guard !Task.isCancelled, let self else { return }
+            guard self.owns, self.confirmed, self.expectedDBID == expected,
+                  self.now.state.isPlaying else { return }
+            self.handoffTask = nil
+            self.handoffAt = nil
+            EventLog.shared.note("advance  hand-off timer")
+            await self.advance(automatically: true)
+        }
+    }
+
+    private func cancelHandoff() {
+        handoffTask?.cancel()
+        handoffTask = nil
+        handoffAt = nil
     }
 
     // MARK: - Queue-driven playback
@@ -237,17 +344,24 @@ final class PlayerController: ObservableObject {
         let ok = await bridge({ try MusicBridge.play(databaseID: dbID, playlistID: playlistID) })
         guard ok == true else {
             if ok == false { lastError = "ライブラリに見つかりません: \(item.track.name)" }
-            await releaseOwnership()
+            await releaseOwnership("could not start \(item.track.name)")
             return
         }
         // After the play, which has just reset the repeat mode to off.
         await applyRepeatOne()
         _ = store.select(item.id)
         expectedDBID = dbID
-        expectedUntil = Date().addingTimeInterval(3)
+        cancelHandoff()
+        startedAt = clock()
+        confirmed = false
+        confirmPosition = nil
+        // Long enough for a cloud track to buffer: positions sat at 0.00 for
+        // over a second after `play` before they started to move.
+        expectedUntil = clock().addingTimeInterval(8)
         owns = true
         lastPosition = 0
-        pollInterval = 0.3
+        pollInterval = 0.5
+        EventLog.shared.note("start  \(item.track.name)  [db \(dbID)]  queue \((store.currentIndex ?? -1) + 1)/\(store.items.count)")
     }
 
     func advance(automatically: Bool = false) async {
@@ -267,7 +381,7 @@ final class PlayerController: ObservableObject {
         } else {
             revision += 1
             _ = await bridge({ try MusicBridge.pause() })
-            await releaseOwnership()
+            await releaseOwnership("end of queue")
         }
     }
 
@@ -315,7 +429,11 @@ final class PlayerController: ObservableObject {
         await startQueueFromTop()
     }
 
-    private func releaseOwnership() async {
+    private func releaseOwnership(_ reason: String = "") async {
+        if owns, !reason.isEmpty { EventLog.shared.note("release  \(reason)") }
+        cancelHandoff()
+        confirmed = false
+        startedAt = nil
         owns = false
         expectedDBID = nil
         expectedUntil = nil

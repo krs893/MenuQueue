@@ -327,14 +327,49 @@ struct RegressionTests {
         await lister.clearQueue()
         assert(MusicBridge.repeatWrites.isEmpty, "nothing to hand back, nothing was taken")
 
-        // The hand-off happens early enough that a poll cannot straddle it.
+        // The bug behind "the song I picked got skipped": right after a track
+        // starts, Music can report the new track's id with the old track's
+        // near-the-end position. That must not be taken as "this one is ending".
         MusicBridge.plays = []
         await lister.playFromPlaylist(album, startAt: 0)
-        MusicBridge.snapshot.position = 100 - PlayerController.handoffLead + 0.05
         MusicBridge.snapshot.state = .playing
+        MusicBridge.snapshot.position = 100 - PlayerController.handoffLead + 0.05
+        await lister.tick()
+        await lister.tick()
+        assert(MusicBridge.plays == [101],
+               "a stale end-of-song position straight after starting must not skip: \(MusicBridge.plays)")
+
+        // Once the track is seen playing and moving forward, reaching the end
+        // does hand over.
+        MusicBridge.snapshot.position = 10
+        await lister.tick()
+        MusicBridge.snapshot.position = 11
+        await lister.tick()
+        MusicBridge.snapshot.position = 100 - PlayerController.handoffLead + 0.05
         await lister.tick()
         assert(MusicBridge.plays == [101, 102],
                "within the hand-off window the next track starts: \(MusicBridge.plays)")
+
+        // The hand-off is timed locally rather than caught by polling fast: a
+        // poll a second before the end schedules it, and it fires on its own.
+        func playUntil(_ remaining: Double) async {
+            MusicBridge.snapshot.state = .playing
+            MusicBridge.snapshot.position = 10; await lister.tick()
+            MusicBridge.snapshot.position = 11; await lister.tick()
+            MusicBridge.snapshot.position = 100 - remaining; await lister.tick()
+        }
+        await playUntil(PlayerController.handoffLead + 0.3)
+        assert(MusicBridge.plays == [101, 102], "nothing yet: still 0.3 s before the hand-off")
+        try await Task.sleep(nanoseconds: 600_000_000)
+        assert(MusicBridge.plays == [101, 102, 103],
+               "the scheduled hand-off fires without another poll: \(MusicBridge.plays)")
+
+        // Pausing stops the clock, so it must also call off the hand-off.
+        await playUntil(PlayerController.handoffLead + 0.3)
+        MusicBridge.snapshot.state = .paused
+        await lister.tick()
+        try await Task.sleep(nanoseconds: 600_000_000)
+        assert(MusicBridge.plays == [101, 102, 103], "a paused track must not be handed over: \(MusicBridge.plays)")
         await lister.clearQueue()
         UserDefaults.standard.removeObject(forKey: "borrowedRepeatMode")
         // Back to the setting the remaining tests are written against. Not a
@@ -530,11 +565,21 @@ struct RegressionTests {
         assert(player.owns && player.lastError == nil)
         print("PASS: missing track releases repeat; polling cannot interrupt a transition")
 
+        // The engine only trusts a track once it has been seen playing and
+        // moving forward mid-song; a jump straight from 0 to the end is the
+        // stale reading that used to skip songs. Play a little first.
+        func confirmPlaying(_ p: PlayerController) async {
+            MusicBridge.snapshot.state = .playing
+            MusicBridge.snapshot.position = 10; await p.tick()
+            MusicBridge.snapshot.position = 11; await p.tick()
+        }
+
         await player.clearQueue()
         store.append([tracks[0]])
         MusicBridge.snapshot.repeatMode = "off"
         await player.startQueueFromTop()
         await player.tick()
+        await confirmPlaying(player)
         MusicBridge.snapshot.position = 99.9
         await player.tick()
         assert(!player.owns && MusicBridge.snapshot.state == .paused)
@@ -545,11 +590,13 @@ struct RegressionTests {
         await player.tick()
         let previousCount = MusicBridge.plays.count
         player.cycleRepeat() // off -> all
+        await confirmPlaying(player)
         MusicBridge.snapshot.position = 99.9
         await player.tick()
         assert(player.owns && MusicBridge.plays.count == previousCount + 1)
         player.cycleRepeat() // all -> one
         await player.tick()
+        await confirmPlaying(player)
         MusicBridge.snapshot.position = 99.9
         await player.tick()
         assert(player.owns && MusicBridge.plays.count == previousCount + 2)
