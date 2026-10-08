@@ -100,7 +100,7 @@ final class LibraryModel: ObservableObject {
                 playlistError = "シャッフル再生できる曲がありません"
                 return
             }
-            await player.playShuffled(tracks)
+            await player.shuffleNatively(playlistIDs: sources.map(\.id), fallback: tracks)
         case .failure(let error):
             playlistError = error.localizedDescription
         }
@@ -118,7 +118,10 @@ final class LibraryModel: ObservableObject {
             self.isLoadingPlaylists = false
             switch outcome {
             case .success(let lists):
-                self.playlists = lists
+                // The working playlist is an implementation detail; listing it
+                // would offer "MenuQueue" as if it were one of the user's own.
+                let working = MusicBridge.workingPlaylistID
+                self.playlists = lists.filter { $0.id != working }
                 self.reconcileFolderPath()
                 // Music exposes no date for a playlist, so there is no
                 // "date added" to sort by. Its own order is the closest thing

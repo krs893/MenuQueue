@@ -21,6 +21,13 @@ struct RegressionTests {
         defer { try? FileManager.default.removeItem(at: shuffleURL) }
         let shuffleStore = QueueStore(fileURL: shuffleURL)
         let shufflePlayer = PlayerController(store: shuffleStore, startPolling: false)
+        // Normally Music itself plays and shuffles everything in scope.
+        await shuffleLibrary.shufflePlay(root, player: shufflePlayer)
+        assert(Set(MusicBridge.workingShuffles.last ?? []) == ["a", "b"],
+               "native shuffle covers exactly the folder's playlists: \(MusicBridge.workingShuffles)")
+        assert(!shufflePlayer.owns, "Music is in charge, not the app queue")
+        // If the working playlist cannot be used, the app queue takes over.
+        MusicBridge.workingFails = true
         await shuffleLibrary.shufflePlay(root, player: shufflePlayer)
         assert(shuffleStore.shuffleActive && shufflePlayer.owns)
         assert(shuffleStore.items.count == 3)
@@ -29,6 +36,7 @@ struct RegressionTests {
         assert(shuffleStore.currentID == shuffleStore.items.first?.id)
         await shuffleLibrary.shufflePlay(a, player: shufflePlayer)
         assert(Set(shuffleStore.items.map { $0.track.databaseID }) == [1, 2])
+        MusicBridge.workingFails = false
         let beforeEmpty = shuffleStore.items
         MusicBridge.stubTracks = [:]
         await shuffleLibrary.shufflePlay(a, player: shufflePlayer)
@@ -376,6 +384,20 @@ struct RegressionTests {
         // `defer`: that would only run at the end of this whole function.
         UserDefaults.standard.set(true, forKey: "gaplessTakeover")
         print("PASS: picking a track plays on through the rest of its playlist")
+
+        // Picking a song hands the rest of its playlist to Music itself.
+        MusicBridge.workingPlays = []
+        await lister.playNatively(playlistID: "PL", tracks: album, startAt: 2)
+        assert(MusicBridge.workingPlays.count == 1 && MusicBridge.workingPlays[0] == ("PL", 2))
+        assert(!lister.owns)
+        // Failing that, the app queue plays it from the same song.
+        MusicBridge.workingFails = true
+        MusicBridge.plays = []
+        await lister.playNatively(playlistID: "PL", tracks: album, startAt: 2)
+        assert(lister.owns && MusicBridge.plays == [103], "fallback starts the chosen song: \(MusicBridge.plays)")
+        MusicBridge.workingFails = false
+        await lister.clearQueue()
+        print("PASS: picks play natively through a working playlist, with the app queue as fallback")
 
         // Media keys arrive packed into data1: key code in the high 16 bits,
         // state in the next byte (0x0A down, 0x0B up), repeat in bit 0.

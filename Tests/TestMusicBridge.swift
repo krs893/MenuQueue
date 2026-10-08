@@ -98,5 +98,20 @@ enum MusicBridge {
     static func playlists() throws -> [PlaylistInfo] { stubPlaylists }
     static func tracks(inPlaylist id: String) throws -> [MusicTrack] { stubTracks[id] ?? [] }
     static func nativeNext() throws { nativeNextCount += 1 }
+    static var workingPlaylistID: String? = "working"
+    static var workingFails = false
+    static var workingPlays: [(String, Int)] = []
+    static var workingShuffles: [[String]] = []
+    static func playFromWorkingPlaylist(source playlistID: String, startAt index: Int) throws {
+        if workingFails { throw TestError.queueAddFailed }
+        workingPlays.append((playlistID, index))
+        snapshot.state = .playing
+    }
+    static func shuffleWorkingPlaylist(_ playlistIDs: [String]) throws {
+        if workingFails { throw TestError.queueAddFailed }
+        workingShuffles.append(playlistIDs)
+        snapshot.state = .playing
+        snapshot.shuffle = true
+    }
     static func nativePrev() throws {}
 }

@@ -402,6 +402,46 @@ final class PlayerController: ObservableObject {
         await play(item: store.items[index])
     }
 
+    /// Plays a playlist from the chosen track onwards with Music in charge, so
+    /// songs follow each other without the load gap and Music's own controls
+    /// and the media keys behave as usual. Falls back to this app's queue if
+    /// the working playlist cannot be used.
+    func playNatively(playlistID: String, tracks: [MusicTrack], startAt index: Int) async {
+        guard tracks.indices.contains(index), !transitioning, !advancing else { return }
+        transitioning = true
+        revision += 1
+        await releaseOwnership()
+        lastError = nil
+        let done: Void? = await bridge {
+            try MusicBridge.playFromWorkingPlaylist(source: playlistID, startAt: index)
+        }
+        transitioning = false
+        if done != nil {
+            EventLog.shared.note("native  \(tracks[index].name)  (\(tracks.count - index) songs via working playlist)")
+            pollInterval = 0.3
+        } else {
+            EventLog.shared.note("native  failed, falling back to the app queue")
+            await playFromPlaylist(tracks, startAt: index)
+        }
+    }
+
+    func shuffleNatively(playlistIDs: [String], fallback tracks: [MusicTrack]) async {
+        guard !playlistIDs.isEmpty, !transitioning, !advancing else { return }
+        transitioning = true
+        revision += 1
+        await releaseOwnership()
+        lastError = nil
+        let done: Void? = await bridge { try MusicBridge.shuffleWorkingPlaylist(playlistIDs) }
+        transitioning = false
+        if done != nil {
+            EventLog.shared.note("native  shuffle of \(playlistIDs.count) playlist(s)")
+            pollInterval = 0.3
+        } else {
+            EventLog.shared.note("native  shuffle failed, falling back to the app queue")
+            await playShuffled(tracks)
+        }
+    }
+
     func playShuffled(_ tracks: [MusicTrack]) async {
         guard !tracks.isEmpty, !transitioning, !advancing else { return }
         store.replaceAll(with: tracks)

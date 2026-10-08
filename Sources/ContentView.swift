@@ -325,7 +325,8 @@ struct LibraryTab: View {
                                     && player.now.state.isPlaying,
                                  play: {
                                      let tracks = library.playlistTracks
-                                     Task { await player.playFromPlaylist(tracks, startAt: index) }
+                                     guard let source = library.selectedPlaylist else { return }
+                                     Task { await player.playNatively(playlistID: source.id, tracks: tracks, startAt: index) }
                                  },
                                  artwork: artwork)
                 }

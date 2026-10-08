@@ -360,6 +360,87 @@ enum MusicBridge {
         try UpNextReader.enqueuePlaylist(id)
     }
 
+    // MARK: Native playback through a working playlist
+    //
+    // Handing Music one track at a time leaves a 0.8-2.5 s silence between
+    // songs while it loads each one, and Music's own next/previous do nothing.
+    // Music only plays continuously — preloading, its own controls working —
+    // within a playlist it is playing itself. So the songs from the chosen one
+    // onwards are copied into a playlist of this app's own, and Music plays
+    // that. Measured: 162 songs copied in about a second, and the library's
+    // track count unchanged by it.
+
+    static let workingPlaylistName = "MenuQueue"
+    private static let workingPlaylistKey = "workingPlaylistID"
+
+    /// The working playlist this app created, by persistent ID. Only ever one
+    /// it made itself: a playlist of the user's that happens to share the name
+    /// is never touched, since using it means emptying it first.
+    static var workingPlaylistID: String? {
+        get { UserDefaults.standard.string(forKey: workingPlaylistKey) }
+        set { UserDefaults.standard.set(newValue, forKey: workingPlaylistKey) }
+    }
+
+    private static func ensureWorkingPlaylist() throws -> String {
+        if let id = workingPlaylistID {
+            let exists = try ScriptRunner.shared.string("""
+            tell application id "com.apple.Music"
+                if exists (first user playlist whose persistent ID is "\(esc(id))") then return "yes"
+                return "no"
+            end tell
+            """)
+            if exists == "yes" { return id }
+        }
+        let id = try ScriptRunner.shared.string("""
+        tell application id "com.apple.Music"
+            set mqW to make new user playlist with properties {name:"\(workingPlaylistName)"}
+            return persistent ID of mqW
+        end tell
+        """)
+        guard !id.isEmpty else { throw ScriptRunner.ScriptError(message: "作業用プレイリストを作れませんでした") }
+        workingPlaylistID = id
+        return id
+    }
+
+    /// Plays `source` from the track at `index` (0-based) onwards, in order,
+    /// as a playlist Music runs itself.
+    static func playFromWorkingPlaylist(source playlistID: String, startAt index: Int) throws {
+        let working = try ensureWorkingPlaylist()
+        try ScriptRunner.shared.run("""
+        tell application id "com.apple.Music"
+            with timeout of 30 seconds
+                set mqW to (first user playlist whose persistent ID is "\(esc(working))")
+                set mqSrc to (first playlist whose persistent ID is "\(esc(playlistID))")
+                delete every track of mqW
+                duplicate (tracks \(index + 1) thru -1 of mqSrc) to mqW
+                -- Picking a song means "from here, in order": with Music's own
+                -- shuffle on, the chosen song would not even play first.
+                set shuffle enabled to false
+                play mqW
+            end timeout
+        end tell
+        """)
+    }
+
+    /// Everything in `playlistIDs`, shuffled by Music itself.
+    static func shuffleWorkingPlaylist(_ playlistIDs: [String]) throws {
+        let working = try ensureWorkingPlaylist()
+        let copies = playlistIDs.map {
+            "duplicate every track of (first playlist whose persistent ID is \"\(esc($0))\") to mqW"
+        }.joined(separator: "\n            ")
+        try ScriptRunner.shared.run("""
+        tell application id "com.apple.Music"
+            with timeout of 60 seconds
+                set mqW to (first user playlist whose persistent ID is "\(esc(working))")
+                delete every track of mqW
+                \(copies)
+                set shuffle enabled to true
+                play mqW
+            end timeout
+        end tell
+        """)
+    }
+
     static func playPlaylist(_ persistentID: String) throws {
         let pid = esc(persistentID)
         let src = """
