@@ -203,6 +203,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if CommandLine.arguments.contains("--window") { showPlayerWindow() }
     }
 
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        showPlayerWindow()
+        return false
+    }
+
     func applicationWillTerminate(_ notification: Notification) {
         mediaKeys.stop()
         clearMarquee()

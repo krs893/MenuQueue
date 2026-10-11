@@ -158,10 +158,23 @@ open build/MenuQueue.app
 インストールは起動中の MenuQueue を終了してから:
 
 ```bash
-mkdir -p ~/Applications
-cp -R build/MenuQueue.app ~/Applications/
-open ~/Applications/MenuQueue.app
+./install.sh
 ```
+
+`~/Applications/MenuQueue.app` にコピーし、Launch Services への登録と Spotlight の索引を要求します。
+起動中は上書きせず停止します。既存アプリと署名の指定要件が一致しない場合も停止し、
+オートメーション・アクセシビリティの許可を維持できるビルドだけを置き換えます。
+保存先を変える場合は `./install.sh /path/to/Applications` を使います。
+
+**⌘ Space → `MenuQueue` と入力 → Return** で開けます。
+起動済みの MenuQueue を Spotlight や Finder から再び開くと、キューのウインドウが前面に出ます。
+初回起動とログイン時起動はメニューバーに表示され、`--window` を付けた初回起動はウインドウも開きます。
+検索への反映には少し時間がかかることがあります。見つからない場合は Spotlight の
+「アプリケーション」の検索が有効か、`~/Applications` が検索対象から除外されていないか確認してください。
+
+アプリアイコンは `Assets/AppIcon.icns` をビルドに含めます。元図形・プレビューは
+`Assets/AppIcon.svg` / `Assets/AppIcon.png`、再生成は `./tools/generate_icon.sh` です。
+Swift / Core Graphics で同じ図形を各サイズに描画し、`iconutil` でまとめます。
 
 設定の電源アイコンでログイン時起動を切り替えられます。
 実行ファイルに `--register-login-item` / `--unregister-login-item` でも切り替えられ、

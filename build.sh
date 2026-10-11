@@ -8,6 +8,7 @@ BIN="$APP/Contents/MacOS/MenuQueue"
 
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+cp Assets/AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"
 
 cat > "$APP/Contents/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
@@ -17,10 +18,11 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
     <key>CFBundleName</key>                  <string>MenuQueue</string>
     <key>CFBundleDisplayName</key>           <string>MenuQueue</string>
     <key>CFBundleExecutable</key>            <string>MenuQueue</string>
+    <key>CFBundleIconFile</key>              <string>AppIcon</string>
     <key>CFBundleIdentifier</key>            <string>jp.local.menuqueue</string>
     <key>CFBundlePackageType</key>           <string>APPL</string>
-    <key>CFBundleShortVersionString</key>    <string>1.3.1</string>
-    <key>CFBundleVersion</key>               <string>6</string>
+    <key>CFBundleShortVersionString</key>    <string>1.3.2</string>
+    <key>CFBundleVersion</key>               <string>7</string>
     <key>LSMinimumSystemVersion</key>        <string>14.0</string>
     <key>LSUIElement</key>                   <true/>
     <key>NSAppleEventsUsageDescription</key>
