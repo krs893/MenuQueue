@@ -29,6 +29,17 @@ enum DiscordIPC {
     }
 }
 
+/// The track as Discord needs it, whichever player it came from.
+struct PresenceTrack: Equatable {
+    var id: String
+    var name: String
+    var artist: String
+    var album: String
+    var duration: Double
+    /// A cover image URL when the player already has one.
+    var artworkURL: String?
+}
+
 /// What Discord shows for a track: "Listening to …", with the song, the
 /// artist, a progress bar and the cover. Pure, so it is tested directly.
 enum DiscordActivity {
@@ -40,7 +51,7 @@ enum DiscordActivity {
         return t
     }
 
-    static func make(track: MusicTrack, position: Double, artworkURL: String?, now: Date) -> [String: Any] {
+    static func make(track: PresenceTrack, position: Double, artworkURL: String?, now: Date) -> [String: Any] {
         let start = now.addingTimeInterval(-max(position, 0))
         var activity: [String: Any] = [
             "type": 2,                       // Listening
@@ -76,9 +87,11 @@ final class DiscordPresence {
 
     static let enabledKey = "discordPresenceEnabled"
     static let clientIDKey = "discordClientID"
-    /// The public "Apple Music" application of NextFire/apple-music-discord-rpc.
-    /// Replace with one's own: `defaults write jp.local.menuqueue discordClientID <id>`.
-    static let defaultClientID = "773825528921849856"
+    /// The public "YouTube Music" application of pear-devs/pear-desktop, so
+    /// the activity reads "Listening to YouTube Music". It belongs to that
+    /// project; replace it with one's own with
+    /// `defaults write jp.local.menuqueue discordClientID <id>`.
+    static let defaultClientID = "1177081335727267940"
 
     static var isEnabled: Bool {
         get { UserDefaults.standard.object(forKey: enabledKey) as? Bool ?? true }
@@ -96,11 +109,11 @@ final class DiscordPresence {
         UserDefaults.standard.string(forKey: Self.clientIDKey) ?? Self.defaultClientID
     }
 
-    func update(_ np: NowPlaying) {
+    /// The track playing now, or nil when nothing is (paused, stopped, gone).
+    func update(_ track: PresenceTrack?, position: Double) {
         let enabled = Self.isEnabled
-        let snapshot = np
         let now = Date()
-        queue.async { self.apply(snapshot, enabled: enabled, now: now) }
+        queue.async { self.apply(track, position: position, enabled: enabled, now: now) }
     }
 
     func shutdown() {
@@ -111,21 +124,21 @@ final class DiscordPresence {
 
     // MARK: - On the queue
 
-    private func apply(_ np: NowPlaying, enabled: Bool, now: Date) {
-        guard enabled, np.state == .playing, let track = np.track, !track.name.isEmpty else {
+    private func apply(_ track: PresenceTrack?, position: Double, enabled: Bool, now: Date) {
+        guard enabled, let track, !track.name.isEmpty else {
             if sentKey != nil, fd >= 0 { _ = send(op: DiscordIPC.frame, clearPayload()) }
             sentKey = nil
             sentStart = nil
             return
         }
-        let key = "\(track.databaseID)|\(track.name)"
-        let start = now.addingTimeInterval(-np.position)
+        let key = "\(track.id)|\(track.name)"
+        let start = now.addingTimeInterval(-position)
         // Same song still playing where it should be: nothing to tell Discord.
         if key == sentKey, let sentStart, abs(sentStart.timeIntervalSince(start)) < 3 { return }
 
         guard connect() else { return }
-        let url = artworkURL(for: track)
-        let activity = DiscordActivity.make(track: track, position: np.position, artworkURL: url, now: now)
+        let url = track.artworkURL ?? artworkURL(for: track)
+        let activity = DiscordActivity.make(track: track, position: position, artworkURL: url, now: now)
         let payload: [String: Any] = [
             "cmd": "SET_ACTIVITY",
             "args": ["pid": Int(ProcessInfo.processInfo.processIdentifier), "activity": activity],
@@ -225,7 +238,7 @@ final class DiscordPresence {
     /// Cover art from Apple's public search API, the way most Apple Music
     /// presence tools do it: Music only hands out raw image bytes, and Discord
     /// needs a URL. Cached per album; a miss is cached too.
-    private func artworkURL(for track: MusicTrack) -> String? {
+    private func artworkURL(for track: PresenceTrack) -> String? {
         let key = "\(track.artist.lowercased())|\(track.album.lowercased())"
         if let cached = artwork[key] { return cached.isEmpty ? nil : cached }
         var found = ""

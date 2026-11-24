@@ -18,22 +18,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var menuPanel: MenuPanel!
     private var localMonitor: Any?
     private var globalMonitor: Any?
-    private var store: QueueStore!
-    private var player: PlayerController!
+    private var player: YTPlayer!
     private var playerWindow: NSWindow?
     private var cancellables = Set<AnyCancellable>()
-    private let mediaKeys = MediaKeyTap()
-    private var stallWatch: Timer?
-    private static let stallMessage = "ミュージックからの応答が止まっています。メニューバーを右クリックして MenuQueue を終了し、開き直してください"
-
-    private func checkForStall() {
-        let stalled = ScriptRunner.shared.stalledSeconds > 20
-        if stalled, player.lastError != Self.stallMessage {
-            player.lastError = Self.stallMessage
-        } else if !stalled, player.lastError == Self.stallMessage {
-            player.lastError = nil
-        }
-    }
 
     /// Menu bar space is shared with every other app — the user wants room for
     /// other status items — so the width is a constant and long titles scroll
@@ -119,9 +106,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if ticker.frame != target { ticker.frame = target }
     }
 
-    private func updateStatusTitle(_ snapshot: NowPlaying) {
+    private func updateStatusTitle(_ s: YTState) {
         guard let button = statusItem?.button else { return }
-        guard let track = snapshot.track, snapshot.state != .stopped else {
+        guard s.hasTrack else {
             clearMarquee()
             button.attributedTitle = NSAttributedString(string: "")
             button.imagePosition = .imageOnly
@@ -129,17 +116,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             button.toolTip = "MenuQueue"
             return
         }
-
         button.imagePosition = .imageLeading
         // A paused track stays readable but recedes, and stops scrolling.
-        setMarquee(text: track.name, playing: snapshot.state.isPlaying)
-        button.toolTip = [track.name, track.artist, track.album]
-            .filter { !$0.isEmpty }.joined(separator: " — ")
+        setMarquee(text: s.title, playing: s.playing)
+        button.toolTip = [s.title, s.artist, s.album].filter { !$0.isEmpty }.joined(separator: " — ")
+    }
+
+    /// What Discord should show: the song while it plays, nothing otherwise.
+    private static func presence(_ s: YTState) -> PresenceTrack? {
+        guard s.hasTrack, s.playing else { return nil }
+        return PresenceTrack(id: "\(s.title)|\(s.artist)", name: s.title, artist: s.artist,
+                             album: s.album, duration: s.duration, artworkURL: s.artwork?.absoluteString)
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        store = QueueStore()
-        player = PlayerController(store: store)
+        player = YTPlayer()
 
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         if let button = statusItem.button {
@@ -158,28 +149,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
         }
 
-        // A call into Music that never comes back cannot be cancelled, but it
-        // must not be left looking like a slow load. Say what happened.
-        stallWatch = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in
-            MainActor.assumeIsolated { self?.checkForStall() }
-        }
-
-        // Next / previous on the keyboard walk this app's queue while it is in
-        // charge; otherwise the keys go to Music as usual.
-        mediaKeys.shouldIntercept = { [weak self] in self?.player.owns ?? false }
-        mediaKeys.onNext = { [weak self] in self?.player.next() }
-        mediaKeys.onPrevious = { [weak self] in self?.player.previous() }
-        mediaKeys.start()
-
         // Keep the menu bar showing whatever is playing.
-        player.$now
+        player.$state
             .receive(on: RunLoop.main)
-            .sink { [weak self] snapshot in self?.updateStatusTitle(snapshot) }
+            .sink { [weak self] s in self?.updateStatusTitle(s) }
             .store(in: &cancellables)
 
-        // And show it as a Discord activity while it plays.
-        player.$now
-            .sink { DiscordPresence.shared.update($0) }
+        // And show it as a Discord activity while it plays. Media keys need no
+        // help here: Chrome handles them for YouTube Music itself.
+        player.$state
+            .sink { s in DiscordPresence.shared.update(Self.presence(s), position: s.position) }
             .store(in: &cancellables)
 
         menuPanel = MenuPanel(contentRect: .zero,
@@ -196,7 +175,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menuPanel.backgroundColor = .clear
         menuPanel.collectionBehavior = [.moveToActiveSpace, .fullScreenAuxiliary]
         let panelContent = NSHostingView(rootView:
-            ContentView(player: player, store: store)
+            YTPanel(player: player)
                 .background(.regularMaterial)
                 .clipShape(RoundedRectangle(cornerRadius: 12)))
         panelContent.sizingOptions = []
@@ -206,9 +185,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             name: NSApplication.didChangeScreenParametersNotification, object: nil)
 
         if CommandLine.arguments.contains("--window") { showPlayerWindow() }
-        if CommandLine.arguments.contains("--resume-queue") {
-            Task { await player.resumeCurrentQueue() }
-        }
     }
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
@@ -218,11 +194,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationWillTerminate(_ notification: Notification) {
         DiscordPresence.shared.shutdown()
-        mediaKeys.stop()
         clearMarquee()
         dismissPanel()
         NotificationCenter.default.removeObserver(self)
-        player?.shutdown()
+        player?.stop()
     }
 
     @objc private func statusItemClicked(_ sender: NSStatusBarButton) {
@@ -237,13 +212,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func showContextMenu() {
         dismissPanel()
         let menu = NSMenu()
-        menu.addItem(withTitle: player.now.state.isPlaying ? "一時停止" : "再生",
+        menu.addItem(withTitle: player.state.playing ? "一時停止" : "再生",
                      action: #selector(menuPlayPause), keyEquivalent: "")
         menu.addItem(withTitle: "次の曲", action: #selector(menuNext), keyEquivalent: "")
         menu.addItem(withTitle: "前の曲", action: #selector(menuPrev), keyEquivalent: "")
         menu.addItem(.separator())
         menu.addItem(withTitle: "ウインドウで開く", action: #selector(showPlayerWindow), keyEquivalent: "")
-        menu.addItem(withTitle: "ミュージックを開く", action: #selector(menuOpenMusic), keyEquivalent: "")
+        menu.addItem(withTitle: "YouTube Music を開く", action: #selector(menuOpenMusic), keyEquivalent: "")
         menu.addItem(.separator())
         menu.addItem(withTitle: "MenuQueue を終了", action: #selector(menuQuit), keyEquivalent: "q")
         for item in menu.items { item.target = self }
@@ -259,7 +234,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                                   styleMask: [.titled, .closable, .miniaturizable, .resizable],
                                   backing: .buffered, defer: false)
             window.title = "MenuQueue"
-            window.contentView = NSHostingView(rootView: ContentView(player: player, store: store))
+            window.contentView = NSHostingView(rootView: YTPanel(player: player))
             window.minSize = NSSize(width: 440, height: 690)
             window.isReleasedWhenClosed = false
             window.center()
@@ -272,7 +247,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc private func menuPlayPause() { player.togglePlayPause() }
     @objc private func menuNext() { player.next() }
     @objc private func menuPrev() { player.previous() }
-    @objc private func menuOpenMusic() { player.launchMusic() }
+    @objc private func menuOpenMusic() { YTMusicBridge.openYouTubeMusic() }
     @objc private func menuQuit() { NSApp.terminate(nil) }
 
     @objc private func displaysChanged() {
@@ -300,7 +275,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                                          screen: screen.frame, visible: screen.visibleFrame)
         menuPanel.setFrame(frame, display: false)
         menuPanel.makeKeyAndOrderFront(nil)
-        player.refreshNativeQueue()
         localMonitor = NSEvent.addLocalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown, .keyDown]) {
             [weak self] event in
             guard let self else { return event }
@@ -315,7 +289,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             [weak self] _ in
             Task { @MainActor in self?.dismissPanel() }
         }
-        Task { await player.tick() }
+        Task { await player.refresh() }
     }
 
 }

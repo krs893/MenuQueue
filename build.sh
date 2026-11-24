@@ -21,30 +21,39 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
     <key>CFBundleIconFile</key>              <string>AppIcon</string>
     <key>CFBundleIdentifier</key>            <string>jp.local.menuqueue</string>
     <key>CFBundlePackageType</key>           <string>APPL</string>
-    <key>CFBundleShortVersionString</key>    <string>1.3.2</string>
-    <key>CFBundleVersion</key>               <string>7</string>
+    <key>CFBundleShortVersionString</key>    <string>2.0.0</string>
+    <key>CFBundleVersion</key>               <string>8</string>
     <key>LSMinimumSystemVersion</key>        <string>14.0</string>
     <key>LSUIElement</key>                   <true/>
     <key>NSAppleEventsUsageDescription</key>
-    <string>ミュージック.app の再生状況を読み取り、キューの曲を再生するために使用します。</string>
-    <key>NSAppleMusicUsageDescription</key>
-    <string>ライブラリの曲を検索してキューに追加するために使用します。</string>
+    <string>Chrome で開いている YouTube Music の再生中の曲を読み取り、再生を操作するために使用します。</string>
 </dict>
 </plist>
 PLIST
 
-echo "checking AppleScript sources…"
-python3 check_scripts.py
-
 echo "compiling…"
-swiftc \
-    -swift-version 5 \
-    -target "${ARCH:-$(uname -m)}-apple-macos14.0" \
-    -O -whole-module-optimization \
-    -framework AppKit -framework SwiftUI -framework ApplicationServices \
-    -framework ServiceManagement \
-    -o "$BIN" \
-    Sources/*.swift
+# RELEASE=1 builds for both Apple Silicon and Intel and signs ad-hoc, so the
+# app runs on anyone's Mac rather than being tied to this machine's certificate.
+compile() {
+    swiftc \
+        -swift-version 5 \
+        -target "$1-apple-macos14.0" \
+        -O -whole-module-optimization \
+        -framework AppKit -framework SwiftUI -framework ApplicationServices \
+        -framework ServiceManagement \
+        -o "$2" \
+        Sources/*.swift
+}
+if [ "${RELEASE:-0}" = "1" ]; then
+    compile arm64 "build/MenuQueue-arm64"
+    compile x86_64 "build/MenuQueue-x86_64"
+    lipo -create -output "$BIN" build/MenuQueue-arm64 build/MenuQueue-x86_64
+    rm -f build/MenuQueue-arm64 build/MenuQueue-x86_64
+    codesign --force --sign - --identifier jp.local.menuqueue "$APP"
+    echo "release build: $(lipo -archs "$BIN"), signed ad-hoc → $APP"
+    exit 0
+fi
+compile "${ARCH:-$(uname -m)}" "$BIN"
 
 # Ad-hoc signing supports local use. A changed binary may require Automation
 # or Accessibility permission again; a stable identifier alone does not prevent this.

@@ -1,223 +1,107 @@
 # MenuQueue
 
-Apple Music をメニューバーから操作する macOS アプリ。
-いま流れている曲をメニューバーに出し、クリックで再生操作のパネルを開きます。
+メニューバーから音楽を操作する macOS アプリです。再生中の曲名をメニューバーに流し、
+クリックで開くパネルから再生操作・音量・キューの確認ができます。聴いている曲を
+Discord のアクティビティに出すこともできます。
 
-## メニューバー
+**YouTube Music 版**と **Apple Music 版**があります。使っているほうを選んでください。
 
-音符アイコンの右に曲名を表示します。長い曲名は10文字ぶんの幅の中を電光掲示板のように
-滑らかに流れます（約28pt/秒、各ループの頭で1.2秒止まって先頭を読めるようにしてあります）。
-一時停止すると止まって先頭を表示します。アーティストとアルバムはツールチップとパネルに出ます。
-「視差効果を減らす」がオンのときは流さず、先頭を表示します。
-
-曲名は一度だけ帯状の画像に描き、Core Animation でずらしているので、動かしている間も
-このアプリはほとんど CPU を使いません（位置の計算と描画はウインドウサーバ側で行われます）。
-
-幅はメニューバーを他のアプリと分け合うため最小限にしてあります。収まる曲名なら
-その分しか占めず、流れているときだけ幅を固定します（隣の項目がガタつかないように）。
-窓の文字数は再ビルドなしで変えられます:
-
-```bash
-defaults write jp.local.menuqueue menuBarTitleWidth -int 6
-```
-一時停止中は淡い色になり、停止中はアイコンだけに戻ります。
-マウスを置くとアルバム名まで出ます。
-
-左クリックでパネル、右クリックで簡易メニュー（再生／一時停止・前後の曲・ミュート・
-ウインドウで開く・ミュージックを開く・終了）。
-
-## パネル
-
-上段にアートワークと曲名・アーティスト・アルバム、ドラッグできるシークバー。
-その下に操作の一列:
-
-| | |
-|---|---|
-| シャッフル | Music のシャッフルを切り替え |
-| 前へ / 再生・一時停止 / 次へ | 連打しても順番に処理します |
-| リピート | オフ → すべて → 1曲 |
-| ミュート | 音量を0にして元の値を覚え、もう一度押すと戻します |
-| 音量 | スライダー。動かすとミュートは解除されます |
-
-下段はプレイリスト。Music で作ったフォルダの階層をそのまま辿れます。
-フォルダを開くと中身、プレイリストを開くと曲が並び、← で一段戻ります。
-プレイリストの ▶ は全体再生、↻ で読み直します。
-曲には左にアルバムのジャケットが出て、再生中の曲にはスピーカーの印が付きます。
-
-**曲をクリックすると、その曲から始めてプレイリストの続きを順に流します。**
-プレイリストやフォルダのキューは最後まで進むと先頭に戻ります。前の曲ボタンは、
-再生位置にかかわらず一つ前の曲へ戻ります。リピートボタンでオフ・1曲にも変更できます。
-Music のライブラリにはプレイリスト・フォルダを作成せず、曲のコピーや削除も行いません。
-
-- プレイリストのシャッフルは、既存のプレイリストを Music に直接渡します。全曲の情報取得やコピーを待ちません。
-- フォルダのシャッフルは、子フォルダを含む曲をアプリ内のキューにまとめます。同じ曲の重複は除きます。
-- 曲を選んで途中から再生するときも、読み込み済みの曲一覧をアプリ内のキューに使います。
-- アプリ内キューの曲送りは、曲の残り時間から時刻を予約して行います。
-- 旧版が作った「MenuQueue」プレイリストは、以後使用・更新しません。不要なら Music から削除できます。
-
-再生状態・必要な曲情報・設定は1回の AppleScript 呼び出しにまとめて読みます。
-曲送りの連打中は曲情報の更新を待たずに順番に操作を送り、連打の最後に表示を更新します。
-
-新しい曲は、曲IDが一致し再生位置が実際に進み始めたのを確認するまで自動の曲送りの対象にしません。
-曲と曲の間には Music が次の曲を読み込む 0.8〜2.5 秒ほどの無音が入ります。
-
-出力先が AirPods などのイヤホンで「自動耳検出」がオンだと、耳に着けていないときは
-Music が再生開始から1秒ほどで自動的に一時停止します。アプリの不具合ではありません。
-
-キューの判断（曲送り・解放とその理由）は
-`~/Library/Application Support/MenuQueue/events.log` に残ります。
-飛ばし・停止が起きたときはこのファイルを見ると原因が分かります。
-
-キューの再生中も Music のリピート設定には触れません。リピートの意味（オフ・すべて・1曲）は
-アプリ側のキューがそのまま引き継ぎます。
-
-並び順は Music 本体と同じです。Music の辞書にはプレイリストの日付が無いため、
-「追加順」に並べることはできません。
-
-フォルダは `every user playlist` には現れず、誰かの `parent` としてしか見えないので、
-`every folder playlist` を別に列挙しています。
-
-ジャケットは画面に出ている行の分だけ取りに行き、アルバム単位でキャッシュします
-（1枚あたり約40ms、271曲のプレイリストでもアルバムは84種）。
-Music が返すのは原寸（実測1200×1200）なので、36pt のサムネイルに縮小して保持します。
-
-Music に再生中の曲が無いときは再生ボタンを淡く落として無効にします。
-その状態では Music 自身の「再生」メニューも無効で、何を送っても鳴らないためです。
-プレイリストを選んで ▶ で再生を始められます。
-
-パネルはクリックした画面のメニューバー直下に開き、その画面の表示可能領域に収まります。
-画面外クリックか Escape で閉じます。右クリックの「ウインドウで開く」で常設表示もできます。
-
-高さは 470pt（操作部と一覧数行ぶん）。メニューバーから下に伸びるので控えめにしてあります。
-変えたいときは再ビルド不要です:
-
-```bash
-defaults write jp.local.menuqueue panelHeight -int 560
-```
-
-## 許可
-
-| 許可 | 用途 | 無いと |
+| | YouTube Music 版 | Apple Music 版 |
 |---|---|---|
-| オートメーション（Music.app） | 再生情報の取得と操作すべて | 何も動きません |
-| アクセシビリティ | キュー再生中にメディアキー（⏭ ⏮）を横取りする | メディアキーは Music に届き、同じ曲の頭に戻るだけになります |
+| 対象 | Chrome で開いた YouTube Music（Chrome でインストールしたアプリ版も可） | macOS の「ミュージック」アプリ |
+| メニューバーに曲名（長い曲名は流れる） | ✓ | ✓ |
+| 再生・一時停止・前後・シーク・音量・ミュート | ✓ | ✓ |
+| キューの表示とジャンプ | ✓（YouTube Music の「次に再生」一覧） | ―（プレイリストから選んで、その曲から順に再生） |
+| Discord に「〇〇を再生中」 | ✓ | ✓ |
+| ソース | `main` ブランチ | `apple-music` ブランチ |
 
-アクセシビリティは設定（歯車）の「メディアキー」行の「許可」から求められます。
-システム設定で許可すると、アプリを再起動しなくても数秒で有効になります。
+## ダウンロードとインストール
 
-### 署名と許可
+1. [Releases](../../releases) から使うほうの zip をダウンロードして展開します
+   - `MenuQueue-YouTubeMusic.zip`
+   - `MenuQueue-AppleMusic.zip`
+2. `MenuQueue.app` を「アプリケーション」フォルダに入れます
+3. 初回だけ、**右クリック → 開く** で起動してください
 
-`build.sh` はログインキーチェーンに `MenuQueue Local Signing` というコード署名用証明書が
-あればそれで署名します。すると許可の照合に使われる指定要件が
+   開発元の登録（Apple の公証）をしていない個人製作のアプリなので、ダブルクリックだと
+   「開けません」と表示されます。右クリック → 開く → 「開く」で一度許可すれば、
+   次からは普通に起動できます。それでも開けない場合は、ターミナルで次を実行してください。
 
-```
-identifier "jp.local.menuqueue" and certificate leaf = H"…"
-```
+   ```bash
+   xattr -dr com.apple.quarantine /Applications/MenuQueue.app
+   ```
 
-と**証明書に紐づく**ので、ソースを変えて再ビルドしても許可は残ります。
-証明書が無いと ad-hoc 署名になり、要件がバイナリのハッシュに紐づくため、
-再ビルドのたびに両方の許可が無効になります（システム設定上はオンのまま見えるのに効かない状態）。
+Intel と Apple Silicon の両方で動きます。macOS 14 以降が必要です。
+2つの版は同じアプリとして扱われるので、どちらか一方だけを入れてください。
 
-証明書はこのマシン専用の自己署名で、キーチェーンで「信頼」する設定は入れていません。
-署名には信頼は不要で、要件は証明書そのものを指すためです。作り方:
+## YouTube Music 版の準備
 
-```bash
-cat > cert.cnf <<'CNF'
-[ req ]
-distinguished_name = dn
-x509_extensions    = ext
-prompt             = no
-[ dn ]
-CN = MenuQueue Local Signing
-[ ext ]
-basicConstraints = critical, CA:false
-keyUsage         = critical, digitalSignature
-extendedKeyUsage = critical, codeSigning
-CNF
-openssl req -x509 -newkey rsa:2048 -nodes -days 3650 -keyout key.pem -out cert.pem -config cert.cnf
-openssl pkcs12 -export -inkey key.pem -in cert.pem -name "MenuQueue Local Signing" -out id.p12 -passout pass:tmp
-security import id.p12 -k ~/Library/Keychains/login.keychain-db -P tmp -T /usr/bin/codesign
-rm key.pem id.p12
-```
+YouTube Music のページを読み取るため、Chrome の設定を1つオンにします。
 
-ad-hoc から証明書に切り替えた直後の1回だけは、記録を消して許可し直す必要があります:
-`tccutil reset AppleEvents jp.local.menuqueue` / `tccutil reset Accessibility jp.local.menuqueue`
-`build.sh` は `MenuQueue Local Signing` という名前のコード署名証明書があれば
-そちらを使い、許可が再ビルドをまたいで残るようにします。
+1. Chrome のメニューバーで **［表示］→［開発 / 管理］→［Apple Events からの JavaScript を許可］**
+   をクリックしてチェックを入れる
+2. MenuQueue を起動すると「MenuQueue が Google Chrome を制御しようとしています」と出るので **許可**
 
-## ビルド・インストール
+> この設定は Chrome 全体に効きます。オンにすると、Chrome を操作する許可を持つアプリは、
+> 開いているページ（ログイン中のサイトを含む）で JavaScript を実行できるようになります。
+> MenuQueue が触るのは `music.youtube.com` のタブだけです。
 
-macOS 14 以降、Music.app、Xcode Command Line Tools が必要です。
+YouTube Music のタブ（またはアプリ版のウインドウ）で曲を再生すれば、メニューバーに曲名が出ます。
+タブが複数あるときは、再生中のタブに従います。メディアキー（⏯ ⏭ ⏮）は Chrome が
+そのまま対応しているので、追加の設定は要りません。
 
-```bash
-./build.sh
-open build/MenuQueue.app
-```
+## Apple Music 版の準備
 
-インストールは起動中の MenuQueue を終了してから:
+起動すると「MenuQueue が ミュージック を制御しようとしています」と出るので **許可** してください。
+キュー再生中にキーボードのメディアキーでも曲送りしたい場合だけ、設定（歯車）の
+「メディアキー」からアクセシビリティを許可します。
 
-```bash
-./install.sh
-```
+## 使い方
 
-`~/Applications/MenuQueue.app` にコピーし、Launch Services への登録と Spotlight の索引を要求します。
-起動中は上書きせず停止します。既存アプリと署名の指定要件が一致しない場合も停止し、
-オートメーション・アクセシビリティの許可を維持できるビルドだけを置き換えます。
-保存先を変える場合は `./install.sh /path/to/Applications` を使います。
+- **左クリック**: パネルを開く（曲・操作・キュー）。外をクリックか Esc で閉じる
+- **右クリック**: 再生／一時停止・前後の曲・アプリを開く・終了
+- パネルの歯車から、ログイン時の自動起動と Discord 表示を切り替えられます
 
-**⌘ Space → `MenuQueue` と入力 → Return** で開けます。
-起動済みの MenuQueue を Spotlight や Finder から再び開くと、キューのウインドウが前面に出ます。
-初回起動とログイン時起動はメニューバーに表示され、`--window` を付けた初回起動はウインドウも開きます。
-検索への反映には少し時間がかかることがあります。見つからない場合は Spotlight の
-「アプリケーション」の検索が有効か、`~/Applications` が検索対象から除外されていないか確認してください。
-
-アプリアイコンは `Assets/AppIcon.icns` をビルドに含めます。元図形・プレビューは
-`Assets/AppIcon.svg` / `Assets/AppIcon.png`、再生成は `./tools/generate_icon.sh` です。
-Swift / Core Graphics で同じ図形を各サイズに描画し、`iconutil` でまとめます。
-
-設定の電源アイコンでログイン時起動を切り替えられます。
-実行ファイルに `--register-login-item` / `--unregister-login-item` でも切り替えられ、
-`--window` を付けると常設ウインドウを開きます。
-
-## 検証
+調整用の設定（ターミナルで実行し、アプリを再起動）:
 
 ```bash
-./build.sh  # AppleScript構文チェック、Swiftコンパイル、署名
-./test.sh   # ユーザーのMusic再生を変えない回帰テスト
+defaults write jp.local.menuqueue menuBarTitleWidth -int 8   # メニューバーの曲名の文字数（既定 10）
+defaults write jp.local.menuqueue panelHeight -int 560       # パネルの高さ（既定 470）
 ```
 
-`check_scripts.py` が `Sources/*.swift` の AppleScript リテラルを `osacompile` に通します。
-Music.app の辞書は `st` や `prop` のような短い識別子を予約語として奪うため、
-素直な変数名は実行時まで気づけないエラーになります。ビルド時に落とすための検査です。
+## Discord 表示について
 
-回帰テストはテスト用 Music アダプターを使い、曲送り・シャッフルの連打、遅い応答、
-古い状態の取得、失敗からの復旧、ミュートの記憶と復元、リピート借用の返却、
-キューの並べ替えと永続化、ライブラリ索引の解析を検証します。
-パネル配置は5種類のディスプレイ配置と左右端で検証します。
+Discord アプリが起動していれば、再生中の曲を「〇〇を再生中」として表示します
+（一時停止で消えます）。表示に使う Discord アプリケーションは、
+YouTube Music 版が [pear-devs/pear-desktop](https://github.com/pear-devs/pear-desktop)、
+Apple Music 版が [NextFire/apple-music-discord-rpc](https://github.com/NextFire/apple-music-discord-rpc)
+が公開しているものを借りています。自分のものに替える場合:
 
-`Tests/MusicReadCheck.swift` は Music から読み取るだけの実機確認用です。
-実際の音声再生と複数画面の実機動作は自動テストの対象外です。
+```bash
+defaults write jp.local.menuqueue discordClientID <アプリケーションID>
+```
 
-## できないこと
+Apple Music 版はジャケット画像を Apple の公開検索 API で探すため、曲名・アーティスト名・
+アルバム名が Apple に送られます。YouTube Music 版はページにある画像をそのまま使います。
 
-**Music のキューへの追加・並べ替えはできません。**
+## ソースからビルド
 
-- AppleScript の辞書に「次に再生（Up Next）」が存在しません（`sdef` で確認できます）
-- アクセシビリティ経由でツールバーのメニューを叩く方法は、macOS 26 では
-  Music のツールバーが子要素を一切公開しない（`AXToolbar kids=0`）ため成立しません
-- `view of front browser window` からプレイリストの persistent ID も取得できません
+Xcode Command Line Tools があれば、Xcode プロジェクトなしでビルドできます。
 
-以前あったキュー表示タブと「キューに追加」ボタンはこの理由で撤去しました。
-キューの操作は Music.app 本体で行ってください。
+```bash
+./build.sh            # このMac向け
+RELEASE=1 ./build.sh  # 配布用（Intel + Apple Silicon、ad-hoc 署名）
+./test.sh             # テスト
+```
 
-## 内部メモ
+## 仕組み（YouTube Music 版）
 
-- ライブラリ検索は `LibraryIndex` が全プレイリストを1往復で読み込み、Swift 側で照合します。
-  Music の `search` 動詞はローカル保存の曲しか見ないため、iCloud ライブラリでは
-  ほとんど何も見つかりません（実測で20曲中0曲）。
-- クラウド曲（`shared track`）は `library playlist 1` に存在しません。
-  再生は所属プレイリストを容器にして `database ID` で引きます。
-- 空のプレイリストは `every track` が `{}` を返す一方 `database ID of every track` が
-  エラーになるため、件数0を先に判定しています。
-- 旧版の独自キューの保存データとモデルは互換性のため残していますが、現在の画面からは
-  使いません。ユーザーの保存済みデータは削除しません。
+Chrome の AppleScript の `execute javascript` で YouTube Music のページを読み書きしています。
+このスクリプトはページとは分離された環境で動き、ページ自身の JavaScript には触れられず、
+スクリプトの差し込みも Trusted Types で拒否されます。ただし画面の要素（DOM）は共有されているので、
+プレーヤーバー・キュー・`<video>` 要素から状態を読み、操作はページ自身のボタンや音量スライダーを
+押す形で行います。人が操作するのと同じ経路なので、YouTube Music 側の状態も正しく保たれます。
+
+## ライセンス
+
+[MIT](LICENSE)

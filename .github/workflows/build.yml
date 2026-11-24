@@ -7,7 +7,7 @@ jobs:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Build and validate AppleScript
+      - name: Build
         run: ./build.sh
-      - name: Queue and player regression checks
+      - name: Tests
         run: ./test.sh
