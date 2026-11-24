@@ -37,14 +37,28 @@ echo "checking AppleScript sources…"
 python3 check_scripts.py
 
 echo "compiling…"
-swiftc \
-    -swift-version 5 \
-    -target "${ARCH:-$(uname -m)}-apple-macos14.0" \
-    -O -whole-module-optimization \
-    -framework AppKit -framework SwiftUI -framework ApplicationServices \
-    -framework ServiceManagement \
-    -o "$BIN" \
-    Sources/*.swift
+# RELEASE=1 builds for both Apple Silicon and Intel and signs ad-hoc, so the
+# app runs on anyone's Mac rather than being tied to this machine's certificate.
+compile() {
+    swiftc \
+        -swift-version 5 \
+        -target "$1-apple-macos14.0" \
+        -O -whole-module-optimization \
+        -framework AppKit -framework SwiftUI -framework ApplicationServices \
+        -framework ServiceManagement \
+        -o "$2" \
+        Sources/*.swift
+}
+if [ "${RELEASE:-0}" = "1" ]; then
+    compile arm64 "build/MenuQueue-arm64"
+    compile x86_64 "build/MenuQueue-x86_64"
+    lipo -create -output "$BIN" build/MenuQueue-arm64 build/MenuQueue-x86_64
+    rm -f build/MenuQueue-arm64 build/MenuQueue-x86_64
+    codesign --force --sign - --identifier jp.local.menuqueue "$APP"
+    echo "release build: $(lipo -archs "$BIN"), signed ad-hoc → $APP"
+    exit 0
+fi
+compile "${ARCH:-$(uname -m)}" "$BIN"
 
 # Ad-hoc signing supports local use. A changed binary may require Automation
 # or Accessibility permission again; a stable identifier alone does not prevent this.
