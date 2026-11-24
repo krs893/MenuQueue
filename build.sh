@@ -80,7 +80,7 @@ if [ -n "$IDENTITY_HASH" ]; then
     codesign --force --sign "$IDENTITY_HASH" --identifier jp.local.menuqueue "$APP"
     echo "signed with: $IDENTITY ($IDENTITY_HASH) — permission grants survive rebuilds"
 else
-    PREVIOUS=$(codesign -dvvv "$HOME/Applications/MenuQueue.app" 2>&1 | awk -F= '/^CDHash=/{print $2; exit}')
+    PREVIOUS=$(codesign -dvvv "$HOME/Applications/MenuQueue.app" 2>&1 | awk -F= '/^CDHash=/{print $2; exit}' || true)
     codesign --force --sign - --identifier jp.local.menuqueue "$APP"
     CURRENT=$(codesign -dvvv "$APP" 2>&1 | awk -F= '/^CDHash=/{print $2; exit}')
     echo "signed ad-hoc"
