@@ -5,14 +5,9 @@ import Combine
 /// Drives Music.app from the app's own queue.
 ///
 /// Music.app exposes no scriptable Up Next, so the only way to own the running
-/// order is to hand it one track at a time. Two things make that seamless:
-///
-///  * while we own playback we set Music's repeat mode to `one`, so when a
-///    track ends Music loops it instead of jumping into some unrelated album;
-///  * polling tightens to 100 ms in the last seconds of a track, so we start
-///    the next queue entry within a fraction of a second of the end.
-///
-/// The previous repeat setting is restored as soon as we let go.
+/// order is to hand it one track at a time. A local timer schedules the next
+/// track from the reported playback position. Artwork loads independently so
+/// a slow image request cannot hold up state updates or that timer.
 @MainActor
 final class PlayerController: ObservableObject {
 
@@ -27,6 +22,12 @@ final class PlayerController: ObservableObject {
     @Published private(set) var lastInsertionPosition: QueueInsertionPosition?
     @Published private(set) var queueRevision = 0
     private var skipTask: Task<Void, Never>?
+    private enum SkipDirection: String { case next, previous }
+    private var pendingSkips: [SkipDirection] = []
+    private var volumeTask: Task<Void, Never>?
+    private var requestedVolume: Int?
+    private static let bridgeQueue = DispatchQueue(label: "jp.menuqueue.control-work", qos: .userInitiated,
+                                                    attributes: .concurrent)
     @Published private var requestedShuffle: Bool?
     private var shuffleTask: Task<Void, Never>?
     private var shuffleRequestVersion = 0
@@ -88,13 +89,36 @@ final class PlayerController: ObservableObject {
     /// position actually moving forward, not near the end.
     private var confirmed = false
     private var confirmPosition: Double?
+    private var notRunningPolls = 0
     /// The scheduled hand-off to the next track; see `scheduleHandoff`.
     private var handoffTask: Task<Void, Never>?
     private var handoffAt: Date?
     private var observer: NSObjectProtocol?
 
-    var displayedRepeat: String { owns ? (savedRepeat ?? now.repeatMode) : now.repeatMode }
+    private var hasManagedQueueContext: Bool {
+        if owns { return true }
+        guard store.mayResumeManagedPlayback, let id = store.currentID,
+              let current = store.items.first(where: { $0.id == id }) else { return false }
+        return current.track.databaseID == now.track?.databaseID
+    }
+
+    var displayedRepeat: String {
+        hasManagedQueueContext ? (store.playbackRepeatMode ?? savedRepeat ?? now.repeatMode) : now.repeatMode
+    }
     private var loopTask: Task<Void, Never>?
+    private var isShutdown = false
+    private final class ArtworkRequest: @unchecked Sendable {
+        private let lock = NSLock()
+        private var cancelled = false
+        func cancel() { lock.lock(); cancelled = true; lock.unlock() }
+        var isCancelled: Bool {
+            lock.lock(); defer { lock.unlock() }
+            return cancelled
+        }
+    }
+    private var artworkRequest: ArtworkRequest?
+    private var artworkTask: Task<Void, Never>?
+    private static let artworkQueue = DispatchQueue(label: "jp.menuqueue.now-playing-artwork", qos: .utility)
     private var artworkDBID: Int?
     private var pollInterval: Double = 1.0
 
@@ -111,6 +135,7 @@ final class PlayerController: ObservableObject {
     }
 
     func start() {
+        guard !isShutdown else { return }
         loopTask?.cancel()
         loopTask = Task { [weak self] in
             while !Task.isCancelled {
@@ -123,9 +148,15 @@ final class PlayerController: ObservableObject {
     }
 
     func shutdown() {
+        isShutdown = true
+        revision += 1
         loopTask?.cancel()
         skipTask?.cancel()
+        volumeTask?.cancel()
         shuffleTask?.cancel()
+        cancelHandoff()
+        artworkRequest?.cancel()
+        artworkTask?.cancel()
         if let observer { DistributedNotificationCenter.default().removeObserver(observer) }
         // Termination must not leave an unawaited task restoring repeat after exit.
         if let saved = savedRepeat ?? pendingRepeatRestore, MusicBridge.isRunning {
@@ -138,22 +169,38 @@ final class PlayerController: ObservableObject {
 
     private func bridge<T>(_ work: @escaping @Sendable () throws -> T) async -> T? {
         do {
-            return try await Task.detached(priority: .userInitiated) { try work() }.value
+            return try await withCheckedThrowingContinuation { done in
+                Self.bridgeQueue.async {
+                    do { done.resume(returning: try work()) }
+                    catch { done.resume(throwing: error) }
+                }
+            }
         } catch {
+            EventLog.shared.note("bridge error  \(error.localizedDescription)")
             await MainActor.run { self.lastError = error.localizedDescription }
             return nil
         }
     }
 
     func tick() async {
-        guard !polling, !transitioning else { return }
+        guard !isShutdown, !polling, !transitioning else { return }
         polling = true
         defer { polling = false }
         let snapshotRevision = revision
-        let running = MusicBridge.isRunning
+        var running = MusicBridge.isRunning
+        // One miss is not "Music quit": wait for it to be gone on consecutive
+        // polls before dropping the queue.
+        if running { notRunningPolls = 0 } else { notRunningPolls += 1 }
+        if !running, notRunningPolls < 3, owns {
+            pollInterval = 1.0
+            return
+        }
         musicRunning = running
         guard running else {
             now = NowPlaying()
+            artworkRequest?.cancel()
+            artworkTask?.cancel()
+            artworkTask = nil
             artwork = nil
             artworkDBID = nil
             pollInterval = 3.0
@@ -174,6 +221,23 @@ final class PlayerController: ObservableObject {
         }
 
         guard snapshotRevision == revision, !transitioning else { return }
+        // Music is playing the queue's current song but the queue let go of it
+        // (a restart, or a lost connection): take it back, or Music will loop
+        // that one song instead of moving on through the playlist.
+        if !owns, np.state.isPlaying, store.mayResumeManagedPlayback,
+           let id = store.currentID, let item = store.items.first(where: { $0.id == id }),
+           item.track.databaseID == np.track?.databaseID {
+            owns = true
+            expectedDBID = item.track.databaseID
+            confirmed = false
+            confirmPosition = nil
+            startedAt = clock()
+            expectedUntil = clock().addingTimeInterval(8)
+            // Pick the borrowed repeat mode back up, so repeat-one that this app
+            // set is not mistaken for the user's own choice.
+            if savedRepeat == nil { savedRepeat = pendingRepeatRestore }
+            EventLog.shared.note("adopt  \(item.track.name)  (Music is playing the queue's current song)")
+        }
         // Music is back (or this is a fresh launch) and we are not driving it:
         // give back anything a previous session borrowed and never returned.
         if !owns, savedRepeat == nil, pendingRepeatRestore != nil {
@@ -182,12 +246,7 @@ final class PlayerController: ObservableObject {
         let previousState = now.state
         now = np
 
-        // Artwork only when the track actually changes — it is the expensive call.
-        if np.track?.databaseID != artworkDBID {
-            artworkDBID = np.track?.databaseID
-            let img = await bridge({ MusicBridge.artworkOfCurrentTrack() }) ?? nil
-            if np.track?.databaseID == artworkDBID { artwork = img }
-        }
+        updateArtwork(for: np.track?.databaseID)
 
         guard snapshotRevision == revision, !transitioning else { return }
         if owns { await evaluateAdvance(np, previousState: previousState) }
@@ -195,6 +254,31 @@ final class PlayerController: ObservableObject {
 
         lastPosition = np.position
         pollInterval = computeInterval(np)
+    }
+
+    /// Images are optional; transport and state polling must never await them.
+    private func updateArtwork(for databaseID: Int?) {
+        guard databaseID != artworkDBID else { return }
+        artworkRequest?.cancel()
+        artworkTask?.cancel()
+        artworkTask = nil
+        artworkDBID = databaseID
+        artwork = nil
+        guard let databaseID else { return }
+        let request = ArtworkRequest()
+        artworkRequest = request
+        artworkTask = Task { [weak self] in
+            let image = await withCheckedContinuation { (done: CheckedContinuation<NSImage?, Never>) in
+                Self.artworkQueue.async {
+                    guard !request.isCancelled else { return done.resume(returning: nil) }
+                    done.resume(returning: MusicBridge.artworkOfCurrentTrack())
+                }
+            }
+            guard !Task.isCancelled, let self, self.artworkDBID == databaseID else { return }
+            self.artwork = image
+            self.artworkTask = nil
+            self.artworkRequest = nil
+        }
     }
 
     /// How long before the end of a track the next one is handed to Music.
@@ -224,6 +308,11 @@ final class PlayerController: ObservableObject {
     private func evaluateAdvance(_ np: NowPlaying, previousState: PlayerState) async {
         let now = clock()
         let sinceStart = startedAt.map { now.timeIntervalSince($0) } ?? .infinity
+        if !confirmed, let deadline = expectedUntil, now >= deadline {
+            lastError = "再生を開始できませんでした: \(store.items.first { $0.id == store.currentID }?.track.name ?? "曲")。もう一度再生してください。"
+            await releaseOwnership("queued track never began playing", keepQueueSession: true)
+            return
+        }
 
         // A track other than ours, or nothing at all.
         if np.track?.databaseID != expectedDBID {
@@ -231,7 +320,7 @@ final class PlayerController: ObservableObject {
                 // Still switching over: Music reports the previous song for a
                 // moment. Only give up if ours never turns up.
                 if let expectedUntil, now < expectedUntil { return }
-                await releaseOwnership("Music never started the queued track")
+                await releaseOwnership("Music never started the queued track", keepQueueSession: true)
                 return
             }
             if np.track == nil, np.state == .stopped {
@@ -332,8 +421,9 @@ final class PlayerController: ObservableObject {
         await start(item)
     }
 
-    private func start(_ item: QueueItem) async {
-        guard !transitioning else { return }
+    @discardableResult
+    private func start(_ item: QueueItem, consumingPrevious: Bool = false) async -> Bool {
+        guard !transitioning else { return false }
         transitioning = true
         revision += 1
         defer { transitioning = false }
@@ -341,15 +431,18 @@ final class PlayerController: ObservableObject {
         await rememberUserRepeat()
         let dbID = item.track.databaseID
         let playlistID = item.track.sourcePlaylistID
+        EventLog.shared.note("request  \(item.track.name)  [db \(dbID)]")
         let ok = await bridge({ try MusicBridge.play(databaseID: dbID, playlistID: playlistID) })
         guard ok == true else {
             if ok == false { lastError = "ライブラリに見つかりません: \(item.track.name)" }
-            await releaseOwnership("could not start \(item.track.name)")
-            return
+            await releaseOwnership("could not start \(item.track.name)", keepQueueSession: true)
+            return false
         }
         // After the play, which has just reset the repeat mode to off.
         await applyRepeatOne()
-        _ = store.select(item.id)
+        if consumingPrevious { store.commitAdvance(to: item.id) }
+        else { _ = store.select(item.id) }
+        store.setManagedPlayback(true)
         expectedDBID = dbID
         cancelHandoff()
         startedAt = clock()
@@ -362,26 +455,29 @@ final class PlayerController: ObservableObject {
         lastPosition = 0
         pollInterval = 0.5
         EventLog.shared.note("start  \(item.track.name)  [db \(dbID)]  queue \((store.currentIndex ?? -1) + 1)/\(store.items.count)")
+        return true
     }
 
-    func advance(automatically: Bool = false) async {
-        guard !advancing, !transitioning else { return }
+    @discardableResult
+    func advance(automatically: Bool = false) async -> Bool {
+        guard !advancing, !transitioning else { return false }
         advancing = true
         defer { advancing = false }
         if automatically, displayedRepeat == "one",
            let item = store.items.first(where: { $0.id == store.currentID }) {
-            await start(item)
-            return
+            return await start(item)
         }
         let repeatAll = displayedRepeat == "all"
-        if let next = store.advance() {
-            await start(next)
+        if let next = store.nextCandidate {
+            return await start(next, consumingPrevious: true)
         } else if repeatAll, let first = store.items.first {
-            await start(first)
+            return await start(first, consumingPrevious: true)
         } else {
+            store.finishCurrent()
             revision += 1
             _ = await bridge({ try MusicBridge.pause() })
             await releaseOwnership("end of queue")
+            return true
         }
     }
 
@@ -399,52 +495,27 @@ final class PlayerController: ObservableObject {
     func playFromPlaylist(_ tracks: [MusicTrack], startAt index: Int) async {
         guard tracks.indices.contains(index), !transitioning, !advancing else { return }
         store.replaceAll(with: tracks)
+        store.consumeOnPlay = false
+        store.setPlaybackRepeatMode("all")
         await play(item: store.items[index])
     }
 
-    /// Plays a playlist from the chosen track onwards with Music in charge, so
-    /// songs follow each other without the load gap and Music's own controls
-    /// and the media keys behave as usual. Falls back to this app's queue if
-    /// the working playlist cannot be used.
-    func playNatively(playlistID: String, tracks: [MusicTrack], startAt index: Int) async {
-        guard tracks.indices.contains(index), !transitioning, !advancing else { return }
+    func shuffleExistingPlaylist(_ id: String) async {
+        guard !transitioning, !advancing else { return }
         transitioning = true
         revision += 1
+        defer { transitioning = false }
         await releaseOwnership()
         lastError = nil
-        let done: Void? = await bridge {
-            try MusicBridge.playFromWorkingPlaylist(source: playlistID, startAt: index)
-        }
-        transitioning = false
-        if done != nil {
-            EventLog.shared.note("native  \(tracks[index].name)  (\(tracks.count - index) songs via working playlist)")
-            pollInterval = 0.3
-        } else {
-            EventLog.shared.note("native  failed, falling back to the app queue")
-            await playFromPlaylist(tracks, startAt: index)
-        }
-    }
-
-    func shuffleNatively(playlistIDs: [String], fallback tracks: [MusicTrack]) async {
-        guard !playlistIDs.isEmpty, !transitioning, !advancing else { return }
-        transitioning = true
-        revision += 1
-        await releaseOwnership()
-        lastError = nil
-        let done: Void? = await bridge { try MusicBridge.shuffleWorkingPlaylist(playlistIDs) }
-        transitioning = false
-        if done != nil {
-            EventLog.shared.note("native  shuffle of \(playlistIDs.count) playlist(s)")
-            pollInterval = 0.3
-        } else {
-            EventLog.shared.note("native  shuffle failed, falling back to the app queue")
-            await playShuffled(tracks)
-        }
+        _ = await bridge { try MusicBridge.shufflePlaylist(id) }
+        pollInterval = 0.3
     }
 
     func playShuffled(_ tracks: [MusicTrack]) async {
         guard !tracks.isEmpty, !transitioning, !advancing else { return }
         store.replaceAll(with: tracks)
+        store.consumeOnPlay = false
+        store.setPlaybackRepeatMode("all")
         store.setShuffle(true)
         await startQueueFromTop()
     }
@@ -452,6 +523,11 @@ final class PlayerController: ObservableObject {
     func startQueueFromTop() async {
         guard let first = store.items.first else { return }
         await play(item: first)
+    }
+
+    func resumeCurrentQueue() async {
+        guard let id = store.currentID, let item = store.items.first(where: { $0.id == id }) else { return }
+        await play(item: item)
     }
 
     func clearQueue() async {
@@ -469,12 +545,13 @@ final class PlayerController: ObservableObject {
         await startQueueFromTop()
     }
 
-    private func releaseOwnership(_ reason: String = "") async {
+    private func releaseOwnership(_ reason: String = "", keepQueueSession: Bool = false) async {
         if owns, !reason.isEmpty { EventLog.shared.note("release  \(reason)") }
         cancelHandoff()
         confirmed = false
         startedAt = nil
         owns = false
+        if !keepQueueSession { store.setManagedPlayback(false) }
         expectedDBID = nil
         expectedUntil = nil
         await restoreRepeat()
@@ -585,41 +662,82 @@ final class PlayerController: ObservableObject {
     }
 
     func next() {
+        queueSkip(.next)
+    }
+
+    func previous() {
+        queueSkip(.previous)
+    }
+
+    private func queueSkip(_ direction: SkipDirection) {
+        guard !isShutdown else { return }
+        EventLog.shared.note("\(direction.rawValue)  clicked (owns=\(owns), queue=\(store.currentIndex.map(String.init) ?? "none"))")
         // Preserve rapid clicks while Music is processing a previous command.
+        pendingSkips.append(direction)
         pendingSkipCount += 1
         guard skipTask == nil else { return }
         skipTask = Task {
-            defer { skipTask = nil; pendingSkipCount = 0 }
-            while pendingSkipCount > 0 && !Task.isCancelled {
+            defer { skipTask = nil; pendingSkipCount = 0; pendingSkips.removeAll() }
+            while let direction = pendingSkips.first, !Task.isCancelled {
                 while transitioning || advancing {
                     try? await Task.sleep(nanoseconds: 30_000_000)
                     if Task.isCancelled { return }
                 }
                 lastError = nil
-                if owns {
-                    await advance()
+                var useQueue = owns
+                if !useQueue {
+                    guard let decision = await shouldResumeQueueForSkip() else { return }
+                    useQueue = decision
+                }
+                var succeeded = true
+                if useQueue {
+                    if direction == .next { succeeded = await advance() }
+                    else if let previous = store.previousCandidate(wrapping: displayedRepeat == "all") {
+                        succeeded = await start(previous)
+                    }
                 } else {
                     revision += 1
-                    _ = await bridge({ try MusicBridge.nativeNext() })
+                    let applied: Void?
+                    if direction == .next { applied = await bridge({ try MusicBridge.nativeNext() }) }
+                    else { applied = await bridge({ try MusicBridge.nativePrev() }) }
+                    succeeded = applied != nil
                 }
+                guard succeeded else { return }
+                pendingSkips.removeFirst()
                 pendingSkipCount -= 1
-                await tick()
             }
+            // Transport does not wait for metadata between clicks. Refresh
+            // once after the burst, without holding up a new button press.
+            if !Task.isCancelled { Task { await tick() } }
         }
     }
 
-    func previous() {
-        Task {
-            guard !transitioning, !advancing else { return }
-            if now.position > 3 {
-                _ = await bridge({ try MusicBridge.seek(to: 0) })
-            } else if owns, let prev = store.previous() {
-                await start(prev)
-            } else {
-                _ = await bridge({ try MusicBridge.nativePrev() })
-            }
-            await tick()
+    private func shouldResumeQueueForSkip() async -> Bool? {
+        guard store.mayResumeManagedPlayback,
+              let id = store.currentID, let item = store.items.first(where: { $0.id == id }) else { return false }
+        let decisionRevision = revision
+        guard let snapshot = await bridge({ try MusicBridge.nowPlaying() }) else { return nil }
+        guard revision == decisionRevision, !transitioning, !advancing,
+              store.currentID == id, store.mayResumeManagedPlayback else { return nil }
+        let matches = snapshot.track?.databaseID == item.track.databaseID
+        let stopped = snapshot.state == .stopped && snapshot.track == nil
+        guard matches || stopped else {
+            store.setManagedPlayback(false)
+            return false
         }
+        // Music can report the source playlist even for a single-track play
+        // whose native Next only restarts that song. A known managed session,
+        // or a legacy selection still in its source list, must use our queue.
+        guard let playlist = await bridge({ try MusicBridge.currentPlaylistID() }) else { return nil }
+        guard revision == decisionRevision, !transitioning, !advancing,
+              store.currentID == id, store.mayResumeManagedPlayback else { return nil }
+        if store.managedPlaybackActive == nil, !playlist.isEmpty,
+           playlist != item.track.sourcePlaylistID {
+            store.setManagedPlayback(false)
+            return false
+        }
+        EventLog.shared.note("skip  resume saved queue after Music/app restart")
+        return true
     }
 
     func seek(to seconds: Double) {
@@ -666,9 +784,21 @@ final class PlayerController: ObservableObject {
         // Moving the slider is an explicit volume choice, so it cancels a mute
         // rather than leaving a stale level to be restored later.
         if v > 0, storedMuteLevel != nil { storedMuteLevel = nil }
-        now.volume = v
+        let target = max(0, min(100, v))
+        now.volume = target
+        requestedVolume = target
         revision += 1
-        Task { _ = await bridge({ try MusicBridge.setVolume(v) }) }
+        guard volumeTask == nil else { return }
+        volumeTask = Task {
+            defer { volumeTask = nil; requestedVolume = nil }
+            do { try await Task.sleep(nanoseconds: 80_000_000) }
+            catch { return }
+            while !Task.isCancelled, let volume = requestedVolume {
+                _ = await bridge { try MusicBridge.setVolume(volume) }
+                revision += 1
+                if requestedVolume == volume { return }
+            }
+        }
     }
 
     /// With a queue loaded, shuffling Music.app would do nothing — we hand it
@@ -726,6 +856,11 @@ final class PlayerController: ObservableObject {
         let idx = order.firstIndex(of: displayedRepeat) ?? 0
         let target = order[(idx + 1) % order.count]
         now.repeatMode = target
+        if hasManagedQueueContext, store.playbackRepeatMode != nil {
+            store.setPlaybackRepeatMode(target)
+            if owns && gaplessTakeover { savedRepeat = target }
+            return
+        }
         if owns && gaplessTakeover { savedRepeat = target } else { Task { _ = await bridge({ try MusicBridge.setRepeat(target) }) } }
         if !owns { Task { await tick() } }
     }

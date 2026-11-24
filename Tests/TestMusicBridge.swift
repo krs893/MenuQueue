@@ -38,9 +38,21 @@ enum MusicBridge {
     static var missing = false
     static var nativeNextCount = 0
     static var lastPlaylist: String?
-    static func playPlaylist(_ id: String) throws { lastPlaylist = id; snapshot.state = .playing }
+    static var nativePlaylistContext = ""
+    static var failPlaylistContextRead = false
+    static func currentPlaylistID() throws -> String {
+        if failPlaylistContextRead { throw TestError.queueAddFailed }
+        return nativePlaylistContext
+    }
+    static func playPlaylist(_ id: String) throws {
+        lastPlaylist = id
+        snapshot.state = .playing
+        snapshot.repeatMode = "all"
+    }
     static var delay: Double = 0
     static var readDelay: Double = 0
+    static var stateReadCount = 0
+    static var failRead = false
     static var shuffleDelay: Double = 0
     static var shuffleWrites: [Bool] = []
     static var failShuffle = false
@@ -55,13 +67,26 @@ enum MusicBridge {
         return .end
     }
     static func nowPlaying() throws -> NowPlaying {
+        stateReadCount += 1
+        if failRead { throw TestError.queueAddFailed }
         let captured = snapshot
         let wait = readDelay
         readStarted.signal()
         Thread.sleep(forTimeInterval: wait)
         return captured
     }
-    static func artworkOfCurrentTrack() -> NSImage? { nil }
+    static var currentArtwork: NSImage?
+    static var artworkGate: DispatchSemaphore?
+    static let artworkStarted = TestSignal()
+    static var currentArtworkFetches = 0
+    static func artworkOfCurrentTrack() -> NSImage? {
+        currentArtworkFetches += 1
+        let image = currentArtwork
+        let gate = artworkGate
+        artworkStarted.signal()
+        _ = gate?.wait(timeout: .now() + 5)
+        return image
+    }
     static var artworkRequests: [Int] = []
     static func artwork(databaseID: Int, playlistID: String?) -> NSImage? {
         artworkRequests.append(databaseID)
@@ -81,7 +106,8 @@ enum MusicBridge {
     }
     static func pause() throws { snapshot.state = .paused }
     static func playPause() throws { snapshot.state = snapshot.state.isPlaying ? .paused : .playing }
-    static func seek(to value: Double) throws { snapshot.position = value }
+    static var seekWrites: [Double] = []
+    static func seek(to value: Double) throws { seekWrites.append(value); snapshot.position = value }
     static func setVolume(_ value: Int) throws { volumeWrites.append(value); snapshot.volume = value }
     static var volumeWrites: [Int] = []
     static func setShuffle(_ value: Bool) throws {
@@ -96,22 +122,20 @@ enum MusicBridge {
     static var stubPlaylists: [PlaylistInfo] = []
     static var stubTracks: [String: [MusicTrack]] = [:]
     static func playlists() throws -> [PlaylistInfo] { stubPlaylists }
-    static func tracks(inPlaylist id: String) throws -> [MusicTrack] { stubTracks[id] ?? [] }
-    static func nativeNext() throws { nativeNextCount += 1 }
-    static var workingPlaylistID: String? = "working"
-    static var workingFails = false
-    static var workingPlays: [(String, Int)] = []
-    static var workingShuffles: [[String]] = []
-    static func playFromWorkingPlaylist(source playlistID: String, startAt index: Int) throws {
-        if workingFails { throw TestError.queueAddFailed }
-        workingPlays.append((playlistID, index))
-        snapshot.state = .playing
+    static var trackReadCount = 0
+    static func tracks(inPlaylist id: String) throws -> [MusicTrack] {
+        trackReadCount += 1
+        return stubTracks[id] ?? []
     }
-    static func shuffleWorkingPlaylist(_ playlistIDs: [String]) throws {
-        if workingFails { throw TestError.queueAddFailed }
-        workingShuffles.append(playlistIDs)
+    static func nativeNext() throws { nativeNextCount += 1 }
+    static var shuffledPlaylists: [String] = []
+    static func shufflePlaylist(_ id: String) throws {
+        guard !(stubTracks[id] ?? []).isEmpty else { throw TestError.queueAddFailed }
+        shuffledPlaylists.append(id)
         snapshot.state = .playing
         snapshot.shuffle = true
+        snapshot.repeatMode = "all"
     }
-    static func nativePrev() throws {}
+    static var nativePrevCount = 0
+    static func nativePrev() throws { nativePrevCount += 1 }
 }

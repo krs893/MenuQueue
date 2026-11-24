@@ -21,22 +21,17 @@ struct RegressionTests {
         defer { try? FileManager.default.removeItem(at: shuffleURL) }
         let shuffleStore = QueueStore(fileURL: shuffleURL)
         let shufflePlayer = PlayerController(store: shuffleStore, startPolling: false)
-        // Normally Music itself plays and shuffles everything in scope.
-        await shuffleLibrary.shufflePlay(root, player: shufflePlayer)
-        assert(Set(MusicBridge.workingShuffles.last ?? []) == ["a", "b"],
-               "native shuffle covers exactly the folder's playlists: \(MusicBridge.workingShuffles)")
-        assert(!shufflePlayer.owns, "Music is in charge, not the app queue")
-        // If the working playlist cannot be used, the app queue takes over.
-        MusicBridge.workingFails = true
         await shuffleLibrary.shufflePlay(root, player: shufflePlayer)
         assert(shuffleStore.shuffleActive && shufflePlayer.owns)
         assert(shuffleStore.items.count == 3)
         assert(Set(shuffleStore.items.map { $0.track.databaseID }) == [1, 2, 3])
         assert(shuffleStore.items.allSatisfy { ["a", "b"].contains($0.track.sourcePlaylistID ?? "") })
         assert(shuffleStore.currentID == shuffleStore.items.first?.id)
+        let readsBeforeDirectPlay = MusicBridge.trackReadCount
         await shuffleLibrary.shufflePlay(a, player: shufflePlayer)
-        assert(Set(shuffleStore.items.map { $0.track.databaseID }) == [1, 2])
-        MusicBridge.workingFails = false
+        assert(MusicBridge.shuffledPlaylists.last == "a" && !shufflePlayer.owns)
+        assert(MusicBridge.trackReadCount == readsBeforeDirectPlay,
+               "Direct playlist shuffle must not enumerate tracks")
         let beforeEmpty = shuffleStore.items
         MusicBridge.stubTracks = [:]
         await shuffleLibrary.shufflePlay(a, player: shufflePlayer)
@@ -302,6 +297,79 @@ struct RegressionTests {
         assert(model.currentFolder == nil && model.visibleEntries.map(\PlaylistInfo.id) == ["P3"])
         print("PASS: playlist folders browse and survive disappearing")
 
+        // Hold the image service open: polling and Next must still complete,
+        // and its stale image must not overwrite the next song's image.
+        let artURL = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: artURL) }
+        let artPlayer = PlayerController(store: QueueStore(fileURL: artURL), startPolling: false)
+        let oldImage = NSImage(size: NSSize(width: 10, height: 10))
+        let newImage = NSImage(size: NSSize(width: 20, height: 20))
+        let artGate = DispatchSemaphore(value: 0)
+        while MusicBridge.artworkStarted.consume() {}
+        MusicBridge.artworkGate = artGate
+        MusicBridge.currentArtwork = oldImage
+        let artworkFetchesBefore = MusicBridge.currentArtworkFetches
+        MusicBridge.snapshot = NowPlaying(state: .playing, track: song(888))
+        let pollCompleted = TestSignal()
+        let imageBlockedPoll = Task { await artPlayer.tick(); pollCompleted.signal() }
+        let imageStartDeadline = Date().addingTimeInterval(3)
+        while !MusicBridge.artworkStarted.consume() {
+            assert(Date() < imageStartDeadline)
+            try await Task.sleep(nanoseconds: 5_000_000)
+        }
+        let pollDeadline = Date().addingTimeInterval(0.5)
+        var completedWhileBlocked = false
+        repeat {
+            completedWhileBlocked = pollCompleted.consume()
+            if completedWhileBlocked { break }
+            try await Task.sleep(nanoseconds: 5_000_000)
+        } while Date() < pollDeadline
+        assert(completedWhileBlocked, "Polling waited for the blocked artwork request")
+        assert(artPlayer.now.track?.databaseID == 888 && artPlayer.artwork == nil)
+        MusicBridge.currentArtwork = newImage
+        MusicBridge.artworkGate = nil
+        MusicBridge.snapshot.track = song(889)
+        await artPlayer.tick()
+        MusicBridge.snapshot.track = song(890)
+        await artPlayer.tick()
+        let nextCount = MusicBridge.nativeNextCount
+        artPlayer.next()
+        artPlayer.next()
+        let nextDeadline = Date().addingTimeInterval(0.5)
+        while artPlayer.pendingSkipCount > 0 && Date() < nextDeadline {
+            try await Task.sleep(nanoseconds: 5_000_000)
+        }
+        assert(MusicBridge.nativeNextCount == nextCount + 2 && artPlayer.pendingSkipCount == 0,
+               "Next must complete while the previous artwork fetch is blocked")
+        assert(artPlayer.now.track?.databaseID == 890 && artPlayer.artwork == nil)
+        artGate.signal()
+        await imageBlockedPoll.value
+        let imageFinishDeadline = Date().addingTimeInterval(3)
+        while artPlayer.artwork !== newImage {
+            assert(Date() < imageFinishDeadline, "Latest artwork did not arrive")
+            assert(artPlayer.artwork !== oldImage, "Stale artwork overwrote the current track")
+            try await Task.sleep(nanoseconds: 5_000_000)
+        }
+        assert(MusicBridge.currentArtworkFetches == artworkFetchesBefore + 2,
+               "Cancelled queued images must be skipped before talking to Music")
+        MusicBridge.snapshot.track = song(891)
+        while MusicBridge.readStarted.consume() {}
+        MusicBridge.readDelay = 0.15
+        let shutdownPoll = Task { await artPlayer.tick() }
+        let shutdownReadDeadline = Date().addingTimeInterval(3)
+        while !MusicBridge.readStarted.consume() {
+            assert(Date() < shutdownReadDeadline)
+            try await Task.sleep(nanoseconds: 5_000_000)
+        }
+        artPlayer.shutdown()
+        await shutdownPoll.value
+        MusicBridge.readDelay = 0
+        await artPlayer.tick()
+        assert(artPlayer.now.track?.databaseID == 890, "Shutdown must disable later notification reads")
+        MusicBridge.currentArtwork = nil
+        MusicBridge.nativeNextCount = nextCount
+        print("PASS: blocked artwork cannot delay polling/Next or overwrite the next track's art")
+
         // Choosing the second song of a playlist plays it and then carries on
         // through the rest: Music drops the playlist context when a single
         // track is started from a script, so the app has to do the carrying.
@@ -385,19 +453,305 @@ struct RegressionTests {
         UserDefaults.standard.set(true, forKey: "gaplessTakeover")
         print("PASS: picking a track plays on through the rest of its playlist")
 
-        // Picking a song hands the rest of its playlist to Music itself.
-        MusicBridge.workingPlays = []
-        await lister.playNatively(playlistID: "PL", tracks: album, startAt: 2)
-        assert(MusicBridge.workingPlays.count == 1 && MusicBridge.workingPlays[0] == ("PL", 2))
-        assert(!lister.owns)
-        // Failing that, the app queue plays it from the same song.
-        MusicBridge.workingFails = true
         MusicBridge.plays = []
-        await lister.playNatively(playlistID: "PL", tracks: album, startAt: 2)
-        assert(lister.owns && MusicBridge.plays == [103], "fallback starts the chosen song: \(MusicBridge.plays)")
-        MusicBridge.workingFails = false
+        await lister.playFromPlaylist(album, startAt: 2)
+        assert(lister.owns && MusicBridge.plays == [103], "Selection plays directly without a working playlist")
+        assert(lister.store.items.map { $0.track.databaseID } == album.map(\.databaseID))
         await lister.clearQueue()
-        print("PASS: picks play natively through a working playlist, with the app queue as fallback")
+        print("PASS: selected tracks play without mutating the Music library")
+
+        // A rejected next-track command must not consume the current song or
+        // move the persisted pointer ahead of Music.
+        UserDefaults.standard.set(false, forKey: "gaplessTakeover")
+        listStore.consumeOnPlay = true
+        MusicBridge.snapshot.repeatMode = "off"
+        await lister.playFromPlaylist(album, startAt: 0)
+        assert(!listStore.consumeOnPlay, "Playlist playback retains songs for Previous and looping")
+        listStore.consumeOnPlay = true // Exercise generic queue consumption separately.
+        let itemsBeforeRejectedPlay = listStore.items
+        let idBeforeRejectedPlay = listStore.currentID
+        MusicBridge.missing = true
+        await lister.advance()
+        assert(listStore.currentID == idBeforeRejectedPlay && listStore.items == itemsBeforeRejectedPlay)
+        assert(QueueStore(fileURL: listDir.appendingPathComponent("list.json")).currentID == idBeforeRejectedPlay)
+        MusicBridge.missing = false
+        await lister.advance()
+        assert(listStore.items.first?.track.databaseID == 102 && listStore.currentID == listStore.items.first?.id)
+        await lister.clearQueue()
+        listStore.consumeOnPlay = false
+
+        // Matching IDs alone do not establish that audio started.
+        var stalledClock = Date()
+        lister.clock = { stalledClock }
+        await lister.playFromPlaylist(album, startAt: 0)
+        MusicBridge.snapshot.position = 0
+        await lister.tick()
+        stalledClock = stalledClock.addingTimeInterval(9)
+        await lister.tick()
+        assert(!lister.owns && lister.lastError != nil,
+               "A track stuck at zero must fail visibly instead of waiting forever")
+        await lister.clearQueue()
+        lister.clock = { Date() }
+        UserDefaults.standard.set(true, forKey: "gaplessTakeover")
+        print("PASS: failed next play preserves the queue; zero-position buffering has a deadline")
+
+        // The Next button must recover a managed single-track queue after
+        // Music or MenuQueue was reopened, without taking over native lists.
+        let skipURL = listDir.appendingPathComponent("next-recovery.json")
+        let skipTracks = [
+            MusicTrack(databaseID: 1334, name: "キッズリターン!", artist: "", album: "", duration: 100, sourcePlaylistID: "source-list"),
+            MusicTrack(databaseID: 2872, name: "あかねさす頃", artist: "", album: "", duration: 100, sourcePlaylistID: "source-list")
+        ]
+        let nativeSkipsBeforeRecoveryTests = MusicBridge.nativeNextCount
+        func waitForSkip(_ control: PlayerController) async throws {
+            let deadline = Date().addingTimeInterval(3)
+            while control.pendingSkipCount > 0 && Date() < deadline {
+                try await Task.sleep(nanoseconds: 5_000_000)
+            }
+            assert(control.pendingSkipCount == 0, "Next did not finish")
+        }
+        func savedFirstTrack() -> QueueStore {
+            let saved = QueueStore(fileURL: skipURL)
+            saved.replaceAll(with: skipTracks)
+            _ = saved.select(saved.items[0].id)
+            saved.setManagedPlayback(true)
+            MusicBridge.snapshot = NowPlaying(state: .playing, track: skipTracks[0])
+            return saved
+        }
+        let initialSkipStore = savedFirstTrack()
+        let musicRestartPlayer = PlayerController(store: initialSkipStore, startPolling: false)
+        await musicRestartPlayer.play(item: initialSkipStore.items[0])
+        MusicBridge.isRunning = false
+        await musicRestartPlayer.tick()
+        MusicBridge.isRunning = true
+        MusicBridge.snapshot = NowPlaying(state: .paused, track: skipTracks[0])
+        let playsBeforeRecoveredNext = MusicBridge.plays.count
+        musicRestartPlayer.next()
+        try await waitForSkip(musicRestartPlayer)
+        assert(MusicBridge.plays.dropFirst(playsBeforeRecoveredNext) == [2872])
+        assert(MusicBridge.nativeNextCount == nativeSkipsBeforeRecoveryTests)
+        await musicRestartPlayer.clearQueue()
+
+        _ = savedFirstTrack()
+        let reloadedSkipStore = QueueStore(fileURL: skipURL)
+        assert(reloadedSkipStore.managedPlaybackActive == true)
+        let reopenedPlayer = PlayerController(store: reloadedSkipStore, startPolling: false)
+        MusicBridge.nativePlaylistContext = "source-list"
+        let playsBeforeReopenedNext = MusicBridge.plays.count
+        reopenedPlayer.next()
+        try await waitForSkip(reopenedPlayer)
+        assert(MusicBridge.plays.dropFirst(playsBeforeReopenedNext) == [2872])
+        await reopenedPlayer.clearQueue()
+        MusicBridge.nativePlaylistContext = ""
+
+        let stoppedStore = savedFirstTrack()
+        let stoppedQueuePlayer = PlayerController(store: stoppedStore, startPolling: false)
+        MusicBridge.snapshot = NowPlaying()
+        stoppedQueuePlayer.next()
+        try await waitForSkip(stoppedQueuePlayer)
+        assert(MusicBridge.plays.last == 2872 && stoppedStore.currentIndex == 1)
+        await stoppedQueuePlayer.clearQueue()
+
+        // Read failures preserve the session for another click, never falling
+        // through to Music's ineffective native Next for a single track.
+        for failContext in [false, true] {
+            _ = savedFirstTrack()
+            let retryStore = QueueStore(fileURL: skipURL)
+            let retryPlayer = PlayerController(store: retryStore, startPolling: false)
+            MusicBridge.failRead = !failContext
+            MusicBridge.failPlaylistContextRead = failContext
+            let playsBeforeReadFailure = MusicBridge.plays.count
+            let nativeBeforeReadFailure = MusicBridge.nativeNextCount
+            retryPlayer.next()
+            try await waitForSkip(retryPlayer)
+            assert(retryPlayer.lastError != nil && retryStore.currentIndex == 0)
+            assert(retryStore.managedPlaybackActive == true)
+            assert(MusicBridge.plays.count == playsBeforeReadFailure && MusicBridge.nativeNextCount == nativeBeforeReadFailure)
+            MusicBridge.failRead = false
+            MusicBridge.failPlaylistContextRead = false
+            retryPlayer.next()
+            try await waitForSkip(retryPlayer)
+            assert(MusicBridge.plays.last == 2872 && retryStore.currentIndex == 1)
+            await retryPlayer.clearQueue()
+        }
+
+        // A rejected play also keeps the session and pointer for retry.
+        let rejectedSkipStore = savedFirstTrack()
+        let rejectedSkipPlayer = PlayerController(store: rejectedSkipStore, startPolling: false)
+        MusicBridge.missing = true
+        rejectedSkipPlayer.next()
+        try await waitForSkip(rejectedSkipPlayer)
+        assert(rejectedSkipStore.currentIndex == 0 && rejectedSkipStore.managedPlaybackActive == true)
+        MusicBridge.missing = false
+        rejectedSkipPlayer.next()
+        try await waitForSkip(rejectedSkipPlayer)
+        assert(rejectedSkipStore.currentIndex == 1 && MusicBridge.plays.last == 2872)
+        await rejectedSkipPlayer.clearQueue()
+
+        for sameTrackInNativePlaylist in [false, true] {
+            let nativeStore = savedFirstTrack()
+            let nativePlayer = PlayerController(store: nativeStore, startPolling: false)
+            await nativePlayer.playNativePlaylist("explicit-native-list")
+            if sameTrackInNativePlaylist { MusicBridge.nativePlaylistContext = "source-list" }
+            let localPlays = MusicBridge.plays.count
+            let nativeSkips = MusicBridge.nativeNextCount
+            nativePlayer.next()
+            try await waitForSkip(nativePlayer)
+            assert(MusicBridge.plays.count == localPlays && MusicBridge.nativeNextCount == nativeSkips + 1)
+            assert(nativeStore.managedPlaybackActive == false)
+            MusicBridge.nativePlaylistContext = ""
+            await nativePlayer.clearQueue()
+        }
+
+        // A new playlist choice while the resume read is in flight supersedes
+        // that old click. It must not start a song in either queue afterwards.
+        let raceStore = savedFirstTrack()
+        let racePlayer = PlayerController(store: raceStore, startPolling: false)
+        while MusicBridge.readStarted.consume() {}
+        MusicBridge.readDelay = 0.15
+        racePlayer.next()
+        let raceReadDeadline = Date().addingTimeInterval(3)
+        while !MusicBridge.readStarted.consume() {
+            assert(Date() < raceReadDeadline)
+            try await Task.sleep(nanoseconds: 5_000_000)
+        }
+        let localPlaysBeforeRace = MusicBridge.plays.count
+        let nativeSkipsBeforeRace = MusicBridge.nativeNextCount
+        await racePlayer.playNativePlaylist("new-user-choice")
+        try await waitForSkip(racePlayer)
+        assert(MusicBridge.plays.count == localPlaysBeforeRace && MusicBridge.nativeNextCount == nativeSkipsBeforeRace)
+        MusicBridge.readDelay = 0
+        await racePlayer.clearQueue()
+
+        // Old queue files lack the managed flag. Match their selected track
+        // and empty native playlist context before safely migrating them.
+        _ = savedFirstTrack()
+        var legacyJSON = try JSONSerialization.jsonObject(with: Data(contentsOf: skipURL)) as! [String: Any]
+        legacyJSON.removeValue(forKey: "managedPlaybackActive")
+        try JSONSerialization.data(withJSONObject: legacyJSON).write(to: skipURL, options: .atomic)
+        let legacyStore = QueueStore(fileURL: skipURL)
+        assert(legacyStore.managedPlaybackActive == nil)
+        let legacyPlayer = PlayerController(store: legacyStore, startPolling: false)
+        MusicBridge.nativePlaylistContext = "source-list"
+        legacyPlayer.next()
+        try await waitForSkip(legacyPlayer)
+        assert(legacyStore.currentIndex == 1 && MusicBridge.plays.last == 2872)
+        await legacyPlayer.clearQueue()
+        MusicBridge.nativePlaylistContext = ""
+        MusicBridge.nativeNextCount = nativeSkipsBeforeRecoveryTests
+        print("PASS: Next recovers キッズリターン→あかねさす across restarts, read/play failure, and legacy queues; native playback remains native")
+
+        UserDefaults.standard.set(false, forKey: "gaplessTakeover")
+        let loopURL = listDir.appendingPathComponent("previous-loop.json")
+        let loopStore = QueueStore(fileURL: loopURL)
+        let loopPlayer = PlayerController(store: loopStore, startPolling: false)
+        loopStore.consumeOnPlay = true
+        await loopPlayer.playFromPlaylist(album, startAt: 3)
+        assert(!loopStore.consumeOnPlay && loopPlayer.displayedRepeat == "all")
+        let loopItems = loopStore.items
+        MusicBridge.snapshot.position = 30
+        await loopPlayer.tick()
+        let seeksBeforePrevious = MusicBridge.seekWrites.count
+        let nativePreviousBefore = MusicBridge.nativePrevCount
+        let previousPlaysStart = MusicBridge.plays.count
+        loopPlayer.previous()
+        try await waitForSkip(loopPlayer)
+        assert(MusicBridge.plays.dropFirst(previousPlaysStart) == [103], "Previous selects the actual previous song after 30 seconds")
+        assert(MusicBridge.seekWrites.count == seeksBeforePrevious && MusicBridge.nativePrevCount == nativePreviousBefore)
+        let backwardsStart = MusicBridge.plays.count
+        loopPlayer.previous(); loopPlayer.previous(); loopPlayer.previous()
+        try await waitForSkip(loopPlayer)
+        assert(MusicBridge.plays.dropFirst(backwardsStart) == [102, 101, 105], "Previous burst retains every click and wraps first to last")
+        let mixedStart = MusicBridge.plays.count
+        loopPlayer.next(); loopPlayer.previous(); loopPlayer.next()
+        try await waitForSkip(loopPlayer)
+        assert(MusicBridge.plays.dropFirst(mixedStart) == [101, 105, 101], "Forward/backward clicks retain FIFO order")
+        assert(loopStore.items == loopItems)
+
+        await loopPlayer.play(item: loopStore.items.last!)
+        await loopPlayer.advance(automatically: true)
+        await loopPlayer.tick()
+        assert(MusicBridge.plays.last == 101 && loopStore.currentIndex == 0)
+        assert(loopStore.items == loopItems && loopPlayer.displayedRepeat == "all", "A full playlist loop preserves all songs and repeat state")
+        assert(QueueStore(fileURL: loopURL).playbackRepeatMode == "all")
+
+        // Failure cannot move the playing pointer backwards before Music accepts.
+        await loopPlayer.play(item: loopStore.items[2])
+        let pointerBeforeFailedPrevious = loopStore.currentID
+        MusicBridge.missing = true
+        loopPlayer.previous()
+        try await waitForSkip(loopPlayer)
+        assert(loopStore.currentID == pointerBeforeFailedPrevious)
+        MusicBridge.missing = false
+        loopPlayer.previous()
+        try await waitForSkip(loopPlayer)
+        assert(MusicBridge.plays.last == 102 && loopStore.currentIndex == 1)
+
+        loopPlayer.cycleRepeat() // all -> one
+        await loopPlayer.advance(automatically: true)
+        assert(MusicBridge.plays.last == 102 && loopStore.currentIndex == 1)
+        loopPlayer.previous()
+        try await waitForSkip(loopPlayer)
+        assert(MusicBridge.plays.last == 101, "Manual Previous moves even in repeat-one")
+        loopPlayer.cycleRepeat() // one -> off
+        await loopPlayer.play(item: loopStore.items[3])
+        await loopPlayer.advance()
+        await loopPlayer.tick()
+        assert(loopPlayer.displayedRepeat == "off", "Polling and track start preserve an explicit repeat choice")
+        await loopPlayer.advance(automatically: true)
+        assert(!loopPlayer.owns && loopStore.currentID == nil)
+        await loopPlayer.clearQueue()
+
+        await loopPlayer.playFromPlaylist(album, startAt: 2)
+        loopPlayer.shutdown()
+        let resumedLoopStore = QueueStore(fileURL: loopURL)
+        let resumedLoopPlayer = PlayerController(store: resumedLoopStore, startPolling: false)
+        MusicBridge.snapshot.position = 30
+        resumedLoopPlayer.previous()
+        try await waitForSkip(resumedLoopPlayer)
+        assert(MusicBridge.plays.last == 102 && resumedLoopPlayer.displayedRepeat == "all")
+        await resumedLoopPlayer.clearQueue()
+        MusicBridge.snapshot.position = 30
+        resumedLoopPlayer.previous()
+        try await waitForSkip(resumedLoopPlayer)
+        assert(MusicBridge.nativePrevCount == nativePreviousBefore + 1 && MusicBridge.seekWrites.count == seeksBeforePrevious)
+        resumedLoopPlayer.shutdown()
+        MusicBridge.nativePrevCount = nativePreviousBefore
+        UserDefaults.standard.set(true, forKey: "gaplessTakeover")
+        print("PASS: real Previous, backward bursts, mixed skips, restart recovery, default playlist loop and explicit off/one")
+
+        UserDefaults.standard.set(false, forKey: "gaplessTakeover")
+        let fastStore = QueueStore(fileURL: listDir.appendingPathComponent("fast-burst.json"))
+        let fastPlayer = PlayerController(store: fastStore, startPolling: false)
+        await fastPlayer.playFromPlaylist(album, startAt: 0)
+        await fastPlayer.tick()
+        MusicBridge.readDelay = 0.5
+        let burstReadsBefore = MusicBridge.stateReadCount
+        let burstPlaysBefore = MusicBridge.plays.count
+        let burstStarted = Date()
+        fastPlayer.next(); fastPlayer.next(); fastPlayer.next()
+        try await waitForSkip(fastPlayer)
+        assert(MusicBridge.plays.dropFirst(burstPlaysBefore) == [102, 103, 104])
+        assert(Date().timeIntervalSince(burstStarted) < 0.5,
+               "Transport must not wait for the slow metadata refresh between clicks")
+        let refreshDeadline = Date().addingTimeInterval(3)
+        while MusicBridge.stateReadCount == burstReadsBefore && Date() < refreshDeadline {
+            try await Task.sleep(nanoseconds: 5_000_000)
+        }
+        assert(MusicBridge.stateReadCount == burstReadsBefore + 1, "A burst should issue one final refresh")
+        MusicBridge.readDelay = 0
+        // Let the already captured slow read finish before changing mock state.
+        try await Task.sleep(nanoseconds: 550_000_000)
+        let pointerBeforeFailedBurst = fastStore.currentID
+        MusicBridge.missing = true
+        fastPlayer.next(); fastPlayer.next(); fastPlayer.next()
+        try await waitForSkip(fastPlayer)
+        assert(fastStore.currentID == pointerBeforeFailedBurst && fastPlayer.lastError != nil)
+        MusicBridge.missing = false
+        await fastPlayer.clearQueue()
+        fastPlayer.shutdown()
+        UserDefaults.standard.set(true, forKey: "gaplessTakeover")
+        print("PASS: skip bursts do not wait for metadata, refresh once, and stop safely on a play failure")
 
         // Media keys arrive packed into data1: key code in the high 16 bits,
         // state in the next byte (0x0A down, 0x0B up), repeat in bit 0.
@@ -417,6 +771,31 @@ struct RegressionTests {
         assert(MediaKey.decode(data1: packed(0, down: true)) == nil)
         assert(MediaKey.decode(data1: packed(7, down: true)) == nil)
         print("PASS: media key events decode to next, previous and play")
+
+        // Discord RPC frames: LE opcode, LE length, JSON. Round trip, and a
+        // partial frame must wait for the rest rather than misparse.
+        var wire = DiscordIPC.encode(opcode: DiscordIPC.frame, json: ["cmd": "SET_ACTIVITY"])!
+        assert(Array(wire.prefix(4)) == [1, 0, 0, 0])
+        let whole = wire
+        var partial = whole.prefix(whole.count - 1)
+        assert(DiscordIPC.decode(&partial) == nil, "half a frame is not a frame")
+        let frame = DiscordIPC.decode(&wire)
+        assert(frame?.opcode == 1 && (frame?.json["cmd"] as? String) == "SET_ACTIVITY" && wire.isEmpty)
+
+        // The activity: Listening, song / artist, a progress bar that matches
+        // the position, the album on the cover, and Discord's 2...128 limits.
+        let clock = Date(timeIntervalSince1970: 1_000_000)
+        let song = MusicTrack(databaseID: 1, name: "ハイキ", artist: "リーガルリリー", album: "kirin", duration: 216)
+        let act = DiscordActivity.make(track: song, position: 16, artworkURL: "https://x/600x600bb.jpg", now: clock)
+        assert(act["type"] as? Int == 2 && act["details"] as? String == "ハイキ" && act["state"] as? String == "リーガルリリー")
+        assert(act["status_display_type"] as? Int == 2, "the status line names the song, not the artist")
+        let ts = act["timestamps"] as! [String: Int64]
+        assert(ts["start"] == 999_984_000 && ts["end"] == 1_000_200_000, "\(ts)")
+        let assets = act["assets"] as! [String: Any]
+        assert(assets["large_image"] as? String == "https://x/600x600bb.jpg" && assets["large_text"] as? String == "kirin")
+        assert(DiscordActivity.fit("A").count == 2)
+        assert(DiscordActivity.fit(String(repeating: "あ", count: 300)).count == 128)
+        print("PASS: Discord frames and the listening activity are built to Discord's rules")
 
         // A duration that is not a usable number must not reach the UI: it ends
         // up as the upper bound of the progress slider's range.
@@ -471,14 +850,48 @@ struct RegressionTests {
         assert(MusicBridge.snapshot.repeatMode == "one", "the queue takes repeat-one while it drives playback")
         assert(UserDefaults.standard.string(forKey: "borrowedRepeatMode") == "all")
         MusicBridge.isRunning = false
+        // A single miss is not trusted as "Music quit": three in a row are.
         await borrower.tick()
+        assert(borrower.owns, "one missed check must not drop the queue")
+        await borrower.tick()
+        await borrower.tick()
+        assert(!borrower.owns)
+        // A relaunched Music comes back stopped, with nothing loaded.
         MusicBridge.isRunning = true
+        MusicBridge.snapshot.state = .stopped
+        MusicBridge.snapshot.track = nil
         await borrower.tick()
         assert(MusicBridge.snapshot.repeatMode == "all",
                "Music quitting mid-queue must not keep the user on repeat-one")
         assert(UserDefaults.standard.string(forKey: "borrowedRepeatMode") == nil)
         UserDefaults.standard.removeObject(forKey: "borrowedRepeatMode")
         print("PASS: the borrowed repeat mode is returned even if Music quits mid-queue")
+
+        // If the queue lets go while Music keeps playing its current song, the
+        // queue must take that song back, or Music loops it forever.
+        let adoptStore = QueueStore(fileURL: orderDir.appendingPathComponent("adopt.json"))
+        adoptStore.append((1...3).map { MusicTrack(databaseID: 50 + $0, name: "a\($0)", artist: "a", album: "b", duration: 100) })
+        MusicBridge.snapshot = NowPlaying()
+        MusicBridge.snapshot.repeatMode = "off"
+        UserDefaults.standard.removeObject(forKey: "borrowedRepeatMode")
+        let adopter = PlayerController(store: adoptStore, startPolling: false)
+        await adopter.startQueueFromTop()
+        MusicBridge.isRunning = false
+        for _ in 0..<3 { await adopter.tick() }
+        assert(!adopter.owns)
+        MusicBridge.isRunning = true
+        MusicBridge.snapshot.state = .playing
+        MusicBridge.snapshot.track = MusicTrack(databaseID: 51, name: "a1", artist: "a", album: "b", duration: 100)
+        MusicBridge.snapshot.position = 10
+        await adopter.tick()
+        assert(adopter.owns, "Music playing the queue's current song is taken back")
+        MusicBridge.plays = []
+        MusicBridge.snapshot.position = 11; await adopter.tick()
+        MusicBridge.snapshot.position = 12; await adopter.tick()
+        MusicBridge.snapshot.position = 99.8; await adopter.tick()
+        assert(MusicBridge.plays == [52], "and moves on to the next song: \(MusicBridge.plays)")
+        await adopter.clearQueue()
+        print("PASS: a dropped queue is taken back instead of Music looping one song")
 
         // Music's mute property cannot be written through AppleScript, so a
         // mute is a volume drop that has to remember the level to come back to.
@@ -648,6 +1061,16 @@ struct RegressionTests {
         await player.playNativePlaylist("playlist-test")
         assert(!player.owns && MusicBridge.lastPlaylist == "playlist-test")
         print("PASS: search and playlists use native Music playback")
+
+        let volumeBurstStart = MusicBridge.volumeWrites.count
+        for volume in 0...100 { player.setVolume(volume) }
+        let volumeBurstDeadline = Date().addingTimeInterval(3)
+        while MusicBridge.volumeWrites.count == volumeBurstStart && Date() < volumeBurstDeadline {
+            try await Task.sleep(nanoseconds: 5_000_000)
+        }
+        assert(MusicBridge.volumeWrites.count == volumeBurstStart + 1 && MusicBridge.volumeWrites.last == 100,
+               "Slider changes must coalesce instead of flooding the command lane")
+        print("PASS: volume bursts send only the latest intent")
 
         // Every click affects the final parity, but each burst sends only one
         // write. In-flight reads and writes must not reset that pending intent.

@@ -16,6 +16,23 @@ final class QueueStore: ObservableObject {
     @Published private(set) var items: [QueueItem] = []
     /// The queue entry the controller believes is currently playing.
     @Published private(set) var currentID: UUID?
+    /// nil is a queue saved before this flag existed; explicit native playback
+    /// writes false so a dormant queue can never take over the Next button.
+    private(set) var managedPlaybackActive: Bool? = false
+    var mayResumeManagedPlayback: Bool { managedPlaybackActive != false && currentID != nil }
+    @Published private(set) var playbackRepeatMode: String?
+
+    func setPlaybackRepeatMode(_ mode: String) {
+        guard ["off", "all", "one"].contains(mode) else { return }
+        playbackRepeatMode = mode
+        save()
+    }
+
+    func setManagedPlayback(_ active: Bool) {
+        guard managedPlaybackActive != active else { return }
+        managedPlaybackActive = active
+        save()
+    }
     /// Drop entries once they have been played instead of keeping a pointer.
     @Published var consumeOnPlay: Bool = false { didSet { save() } }
     /// Shuffle applies to this list, not to Music.app. Music.app's own shuffle
@@ -46,6 +63,8 @@ final class QueueStore: ObservableObject {
         var shuffleActive: Bool?
         var preShuffleOrder: [UUID]?
         var shuffleOriginOrder: [UUID]?
+        var managedPlaybackActive: Bool?
+        var playbackRepeatMode: String?
     }
 
     init(fileURL: URL? = nil) {
@@ -172,6 +191,8 @@ final class QueueStore: ObservableObject {
         preShuffleOrder = nil
         shuffleOriginOrder = nil
         currentID = nil
+        managedPlaybackActive = false
+        playbackRepeatMode = nil
         save()
     }
 
@@ -181,6 +202,35 @@ final class QueueStore: ObservableObject {
         preShuffleOrder = nil
         shuffleOriginOrder = nil
         currentID = nil
+        managedPlaybackActive = false
+        playbackRepeatMode = nil
+        save()
+    }
+
+    /// Look ahead without consuming or persisting a song before Music accepts it.
+    var nextCandidate: QueueItem? {
+        guard let i = currentIndex else { return items.first }
+        return i + 1 < items.count ? items[i + 1] : nil
+    }
+
+    func previousCandidate(wrapping: Bool) -> QueueItem? {
+        guard let i = currentIndex else { return nil }
+        return i > 0 ? items[i - 1] : wrapping ? items.last : items[i]
+    }
+
+    func commitAdvance(to id: UUID) {
+        guard items.contains(where: { $0.id == id }) else { return }
+        if consumeOnPlay, let currentID, currentID != id {
+            items.removeAll { $0.id == currentID }
+        }
+        currentID = id
+        save()
+    }
+
+    func finishCurrent() {
+        if consumeOnPlay, let currentID { items.removeAll { $0.id == currentID } }
+        currentID = nil
+        managedPlaybackActive = false
         save()
     }
 
@@ -230,7 +280,9 @@ final class QueueStore: ObservableObject {
                                  consumeOnPlay: consumeOnPlay,
                                  shuffleActive: shuffleActive,
                                  preShuffleOrder: preShuffleOrder,
-                                 shuffleOriginOrder: shuffleOriginOrder)
+                                 shuffleOriginOrder: shuffleOriginOrder,
+                                 managedPlaybackActive: managedPlaybackActive,
+                                 playbackRepeatMode: playbackRepeatMode)
         do {
             let data = try JSONEncoder().encode(snapshot)
             try FileManager.default.createDirectory(at: fileURL.deletingLastPathComponent(),
@@ -251,6 +303,8 @@ final class QueueStore: ObservableObject {
             let p = try JSONDecoder().decode(Persisted.self, from: data)
             items = p.items
             currentID = items.contains { $0.id == p.currentID } ? p.currentID : nil
+            managedPlaybackActive = currentID == nil ? false : p.managedPlaybackActive
+            playbackRepeatMode = p.playbackRepeatMode
             consumeOnPlay = p.consumeOnPlay ?? false
             shuffleActive = p.shuffleActive ?? false
             preShuffleOrder = p.preShuffleOrder

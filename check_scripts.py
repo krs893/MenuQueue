@@ -7,6 +7,10 @@ import re, subprocess, tempfile, os, sys, textwrap
 import glob
 src = "\n".join(open(f).read() for f in sorted(glob.glob('Sources/*.swift')))
 
+# Playback must never add containers or copy/delete tracks in the Music library.
+if re.search(r'\bmake\s+new\s+(?:user\s+|folder\s+)?playlist\b|\bduplicate\s|\bdelete\s+every\s+track', src, re.I):
+    sys.exit("Playback scripts must not create playlists or mutate their tracks")
+
 handler = re.search(r'private static let joinHandler = """\n(.*?)\n    """', src, re.S).group(1)
 handler = textwrap.dedent(handler)
 

@@ -63,11 +63,12 @@ final class LibraryModel: ObservableObject {
 
     /// Walk descendants once, including nested folders but excluding siblings.
     func playbackPlaylists(in entry: PlaylistInfo) -> [PlaylistInfo] {
+        let children = Dictionary(grouping: playlists, by: \.parentID)
         var visited = Set<String>()
         func walk(_ item: PlaylistInfo) -> [PlaylistInfo] {
             guard visited.insert(item.id).inserted else { return [] }
             if !item.isFolder { return [item] }
-            return playlists.filter { $0.parentID == item.id }.flatMap { walk($0) }
+            return (children[item.id] ?? []).flatMap { walk($0) }
         }
         return walk(entry)
     }
@@ -77,6 +78,12 @@ final class LibraryModel: ObservableObject {
         isPreparingShuffle = true
         playlistError = nil
         defer { isPreparingShuffle = false }
+        // Music already owns this list. Avoid reading every track before play.
+        if !entry.isFolder {
+            await player.shuffleExistingPlaylist(entry.id)
+            playlistError = player.lastError
+            return
+        }
         let sources = playbackPlaylists(in: entry)
         let outcome = await Task.detached(priority: .userInitiated) {
             Result { () throws -> [MusicTrack] in
@@ -100,7 +107,7 @@ final class LibraryModel: ObservableObject {
                 playlistError = "シャッフル再生できる曲がありません"
                 return
             }
-            await player.shuffleNatively(playlistIDs: sources.map(\.id), fallback: tracks)
+            await player.playShuffled(tracks)
         case .failure(let error):
             playlistError = error.localizedDescription
         }
@@ -118,10 +125,7 @@ final class LibraryModel: ObservableObject {
             self.isLoadingPlaylists = false
             switch outcome {
             case .success(let lists):
-                // The working playlist is an implementation detail; listing it
-                // would offer "MenuQueue" as if it were one of the user's own.
-                let working = MusicBridge.workingPlaylistID
-                self.playlists = lists.filter { $0.id != working }
+                self.playlists = lists
                 self.reconcileFolderPath()
                 // Music exposes no date for a playlist, so there is no
                 // "date added" to sort by. Its own order is the closest thing

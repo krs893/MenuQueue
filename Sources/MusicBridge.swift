@@ -1,68 +1,6 @@
 import Foundation
 import AppKit
 
-// MARK: - AppleScript runner
-// NSAppleScript is not thread-safe, so every call is funnelled through one
-// serial queue. Compiled scripts are cached because the polling loop reuses
-// the same sources once a second.
-
-final class ScriptRunner {
-    static let shared = ScriptRunner()
-    private let queue = DispatchQueue(label: "jp.menuqueue.applescript")
-    private var cache: [String: NSAppleScript] = [:]
-
-    struct ScriptError: LocalizedError {
-        let message: String
-        var errorDescription: String? { message }
-    }
-
-    /// When the call currently running on the queue began, nil when idle.
-    ///
-    /// A single Apple Event that Music never answers blocks this queue for
-    /// good — NSAppleScript waited days on one artwork request, past the
-    /// AppleScript default timeout — and every later call queues up behind
-    /// it. The call itself cannot be cancelled, but the app can at least see
-    /// that it has happened and say so instead of spinning forever.
-    private let inFlightLock = NSLock()
-    private var inFlightSince: Date?
-
-    var stalledSeconds: TimeInterval {
-        inFlightLock.lock(); defer { inFlightLock.unlock() }
-        return inFlightSince.map { Date().timeIntervalSince($0) } ?? 0
-    }
-
-    @discardableResult
-    func run(_ source: String) throws -> NSAppleEventDescriptor {
-        try queue.sync {
-            inFlightLock.lock(); inFlightSince = Date(); inFlightLock.unlock()
-            defer { inFlightLock.lock(); inFlightSince = nil; inFlightLock.unlock() }
-            let script: NSAppleScript
-            if let cached = cache[source] {
-                script = cached
-            } else {
-                guard let s = NSAppleScript(source: source) else {
-                    throw ScriptError(message: "script could not be created")
-                }
-                if cache.count >= 128 { cache.removeAll(keepingCapacity: true) }
-                cache[source] = s
-                script = s
-            }
-            var err: NSDictionary?
-            let result = script.executeAndReturnError(&err)
-            if let err {
-                let msg = (err[NSAppleScript.errorMessage] as? String) ?? "unknown AppleScript error"
-                let num = (err[NSAppleScript.errorNumber] as? Int).map { " (\($0))" } ?? ""
-                throw ScriptError(message: msg + num)
-            }
-            return result
-        }
-    }
-
-    func string(_ source: String) throws -> String {
-        try run(source).stringValue ?? ""
-    }
-}
-
 // MARK: - Music.app bridge
 
 enum MusicBridge {
@@ -71,8 +9,24 @@ enum MusicBridge {
     /// Record separator — safer than tab, which can legitimately appear in tags.
     private static let RS = "\u{1E}"
 
+    private static let pidLock = NSLock()
+    private static var lastPID: pid_t = 0
+
+    /// Whether Music is running.
+    ///
+    /// NSRunningApplication alone is not trustworthy enough to act on: it once
+    /// came back empty while Music had been running for days, the queue let go
+    /// of playback because of it, and Music then looped the single track it had
+    /// been handed for the next forty minutes. So a miss is checked against the
+    /// process itself before it counts.
     static var isRunning: Bool {
-        !NSRunningApplication.runningApplications(withBundleIdentifier: bundleID).isEmpty
+        if let app = NSRunningApplication.runningApplications(withBundleIdentifier: bundleID).first {
+            pidLock.lock(); lastPID = app.processIdentifier; pidLock.unlock()
+            return true
+        }
+        pidLock.lock(); let pid = lastPID; pidLock.unlock()
+        // Signal 0 checks the process exists without touching it.
+        return pid > 0 && kill(pid, 0) == 0
     }
 
     private static func esc(_ s: String) -> String {
@@ -103,118 +57,63 @@ enum MusicBridge {
 
     // MARK: Now playing, cheaply
     //
-    // Music takes about 35 ms to answer each Apple Event, and the old query
-    // asked a dozen questions every poll — around 300 ms, polled up to ten
-    // times a second near the end of a track. Most of those answers do not
-    // change from one poll to the next. So each poll now asks only what does
-    // (state, track id, position); the track's name, artist, album and length
-    // are fetched when the id changes, and the player settings every third poll
-    // or straight after this app changes one.
-
-    private static let cacheLock = NSLock()
-    private static var cachedTrack: MusicTrack?
-    private static var cachedSettings: (shuffle: Bool, repeatMode: String, volume: Int, muted: Bool)?
-    private static var pollsSinceSettings = 0
+    // Each child takes around 110 ms to start. Ask for changing state and any
+    // uncached metadata/settings in the same child instead of launching three
+    // on a track change. Warm polls still ask Music only for state/id/position.
+    private static let statusCache = MusicStatusCache()
 
     /// Called after this app writes a setting, so the next poll reads it back.
     static func invalidateSettings() {
-        cacheLock.lock(); cachedSettings = nil; cacheLock.unlock()
+        statusCache.invalidateSettings()
     }
 
-    private static let coreQuery = joinHandler + """
+    private static func statusQuery(for request: MusicStatusCache.Request) -> String {
+        joinHandler + """
     tell application id "com.apple.Music"
         set mqState to (player state as text)
         set mqID to "0"
         set mqPos to "0"
+        set mqMetadataID to "0"
+        set mqName to ""
+        set mqArtist to ""
+        set mqAlbum to ""
+        set mqDur to "0"
+        set mqShuffle to ""
+        set mqRepeat to ""
+        set mqVol to ""
+        set mqMute to ""
         try
             set mqID to ((database ID of current track) as text)
         end try
         try
             set mqPos to ((player position) as text)
         end try
+        if mqID is not "0" and mqID is not "\(request.cachedTrackID)" then
+            try
+                set mqTrack to current track
+                set mqMetadataID to ((database ID of mqTrack) as text)
+                set mqName to (name of mqTrack)
+                set mqArtist to (artist of mqTrack)
+                set mqAlbum to (album of mqTrack)
+                set mqDur to ((duration of mqTrack) as text)
+            end try
+        end if
+        if "\(request.settingsDue)" is "true" then
+            set mqShuffle to ((shuffle enabled) as text)
+            set mqRepeat to ((song repeat) as text)
+            set mqVol to ((sound volume) as text)
+            set mqMute to ((mute) as text)
+        end if
     end tell
-    return my joinList({mqState, mqID, mqPos})
+    return my joinList({mqState, mqID, mqPos, mqMetadataID, mqName, mqArtist, mqAlbum, mqDur, mqShuffle, mqRepeat, mqVol, mqMute})
     """
-
-    private static let trackQuery = joinHandler + """
-    tell application id "com.apple.Music"
-        set mqID to "0"
-        set mqName to ""
-        set mqArtist to ""
-        set mqAlbum to ""
-        set mqDur to "0"
-        try
-            set mqTrack to current track
-            set mqID to ((database ID of mqTrack) as text)
-            set mqName to (name of mqTrack)
-            set mqArtist to (artist of mqTrack)
-            set mqAlbum to (album of mqTrack)
-            set mqDur to ((duration of mqTrack) as text)
-        end try
-    end tell
-    return my joinList({mqID, mqName, mqArtist, mqAlbum, mqDur})
-    """
-
-    private static let settingsQuery = joinHandler + """
-    tell application id "com.apple.Music"
-        set mqShuffle to ((shuffle enabled) as text)
-        set mqRepeat to ((song repeat) as text)
-        set mqVol to ((sound volume) as text)
-        set mqMute to ((mute) as text)
-    end tell
-    return my joinList({mqShuffle, mqRepeat, mqVol, mqMute})
-    """
+    }
 
     static func nowPlaying() throws -> NowPlaying {
         guard isRunning else { return NowPlaying() }
-        let core = try ScriptRunner.shared.string(coreQuery).components(separatedBy: RS)
-        guard core.count >= 3 else { return NowPlaying() }
-
-        var np = NowPlaying()
-        np.state = PlayerState(appleScript: core[0])
-        let dbID = Int(core[1]) ?? 0
-        np.position = number(core[2])
-
-        cacheLock.lock()
-        var track = cachedTrack
-        var settings = cachedSettings
-        pollsSinceSettings += 1
-        let settingsDue = settings == nil || pollsSinceSettings >= 3
-        cacheLock.unlock()
-
-        if dbID == 0 {
-            track = nil
-        } else if track?.databaseID != dbID {
-            let f = try ScriptRunner.shared.string(trackQuery).components(separatedBy: RS)
-            // The track can change between the two queries; only keep details
-            // that belong to the id this poll is reporting.
-            if f.count >= 5, Int(f[0]) == dbID {
-                track = MusicTrack(databaseID: dbID, name: f[1], artist: f[2],
-                                   album: f[3], duration: number(f[4]))
-            } else {
-                track = MusicTrack(databaseID: dbID, name: "", artist: "", album: "", duration: 0)
-            }
+        return try statusCache.read { request in
+            try ScriptRunner.state.string(statusQuery(for: request))
         }
-        if settingsDue {
-            let f = try ScriptRunner.shared.string(settingsQuery).components(separatedBy: RS)
-            if f.count >= 4 {
-                settings = (f[0] == "true", f[1], Int(Double(f[2]) ?? 100), f[3] == "true")
-            }
-        }
-
-        cacheLock.lock()
-        if let track, !track.name.isEmpty { cachedTrack = track } else if dbID == 0 { cachedTrack = nil }
-        if settingsDue, let settings { cachedSettings = settings; pollsSinceSettings = 0 }
-        cacheLock.unlock()
-
-        np.track = track
-        if let settings {
-            np.shuffle = settings.shuffle
-            np.repeatMode = settings.repeatMode
-            np.volume = settings.volume
-            np.muted = settings.muted
-        }
-        return np
     }
 
     /// Runs a script that writes artwork bytes to a file, in a separate
@@ -293,14 +192,14 @@ enum MusicBridge {
     // MARK: Transport
 
     private static func tellMusic(_ body: String) throws {
-        try ScriptRunner.shared.run("tell application id \"com.apple.Music\"\n\(body)\nend tell")
+        try ScriptRunner.transport.run("tell application id \"com.apple.Music\"\n\(body)\nend tell")
     }
 
     static func playPause() throws { try tellMusic("playpause") }
     static func pause()     throws { try tellMusic("pause") }
     static func resume()    throws { try tellMusic("play") }
     static func nativeNext()  throws { try tellMusic("next track") }
-    static func nativePrev()  throws { try tellMusic("back track") }
+    static func nativePrev()  throws { try tellMusic("previous track") }
     static func stop()      throws { try tellMusic("stop") }
 
     static func seek(to seconds: Double) throws {
@@ -350,7 +249,7 @@ enum MusicBridge {
             return "ok"
         end tell
         """
-        return try ScriptRunner.shared.string(src) == "ok"
+        return try (validateOnly ? ScriptRunner.shared : ScriptRunner.transport).string(src) == "ok"
     }
 
     /// No longer reachable from the UI: driving Music's toolbar menu through
@@ -360,85 +259,18 @@ enum MusicBridge {
         try UpNextReader.enqueuePlaylist(id)
     }
 
-    // MARK: Native playback through a working playlist
-    //
-    // Handing Music one track at a time leaves a 0.8-2.5 s silence between
-    // songs while it loads each one, and Music's own next/previous do nothing.
-    // Music only plays continuously — preloading, its own controls working —
-    // within a playlist it is playing itself. So the songs from the chosen one
-    // onwards are copied into a playlist of this app's own, and Music plays
-    // that. Measured: 162 songs copied in about a second, and the library's
-    // track count unchanged by it.
-
-    static let workingPlaylistName = "MenuQueue"
-    private static let workingPlaylistKey = "workingPlaylistID"
-
-    /// The working playlist this app created, by persistent ID. Only ever one
-    /// it made itself: a playlist of the user's that happens to share the name
-    /// is never touched, since using it means emptying it first.
-    static var workingPlaylistID: String? {
-        get { UserDefaults.standard.string(forKey: workingPlaylistKey) }
-        set { UserDefaults.standard.set(newValue, forKey: workingPlaylistKey) }
-    }
-
-    private static func ensureWorkingPlaylist() throws -> String {
-        if let id = workingPlaylistID {
-            let exists = try ScriptRunner.shared.string("""
-            tell application id "com.apple.Music"
-                if exists (first user playlist whose persistent ID is "\(esc(id))") then return "yes"
-                return "no"
-            end tell
-            """)
-            if exists == "yes" { return id }
-        }
-        let id = try ScriptRunner.shared.string("""
+    /// Play an existing playlist directly: no library mutations or track copies.
+    static func shufflePlaylist(_ persistentID: String) throws {
+        try ScriptRunner.transport.run("""
         tell application id "com.apple.Music"
-            set mqW to make new user playlist with properties {name:"\(workingPlaylistName)"}
-            return persistent ID of mqW
+            set mqPlaylist to first user playlist whose persistent ID is "\(esc(persistentID))"
+            if (count of tracks of mqPlaylist) is 0 then error "シャッフル再生できる曲がありません"
+            set shuffle enabled to true
+            play mqPlaylist
+            set song repeat to all
         end tell
         """)
-        guard !id.isEmpty else { throw ScriptRunner.ScriptError(message: "作業用プレイリストを作れませんでした") }
-        workingPlaylistID = id
-        return id
-    }
-
-    /// Plays `source` from the track at `index` (0-based) onwards, in order,
-    /// as a playlist Music runs itself.
-    static func playFromWorkingPlaylist(source playlistID: String, startAt index: Int) throws {
-        let working = try ensureWorkingPlaylist()
-        try ScriptRunner.shared.run("""
-        tell application id "com.apple.Music"
-            with timeout of 30 seconds
-                set mqW to (first user playlist whose persistent ID is "\(esc(working))")
-                set mqSrc to (first playlist whose persistent ID is "\(esc(playlistID))")
-                delete every track of mqW
-                duplicate (tracks \(index + 1) thru -1 of mqSrc) to mqW
-                -- Picking a song means "from here, in order": with Music's own
-                -- shuffle on, the chosen song would not even play first.
-                set shuffle enabled to false
-                play mqW
-            end timeout
-        end tell
-        """)
-    }
-
-    /// Everything in `playlistIDs`, shuffled by Music itself.
-    static func shuffleWorkingPlaylist(_ playlistIDs: [String]) throws {
-        let working = try ensureWorkingPlaylist()
-        let copies = playlistIDs.map {
-            "duplicate every track of (first playlist whose persistent ID is \"\(esc($0))\") to mqW"
-        }.joined(separator: "\n            ")
-        try ScriptRunner.shared.run("""
-        tell application id "com.apple.Music"
-            with timeout of 60 seconds
-                set mqW to (first user playlist whose persistent ID is "\(esc(working))")
-                delete every track of mqW
-                \(copies)
-                set shuffle enabled to true
-                play mqW
-            end timeout
-        end tell
-        """)
+        invalidateSettings()
     }
 
     static func playPlaylist(_ persistentID: String) throws {
@@ -447,15 +279,31 @@ enum MusicBridge {
         tell application id "com.apple.Music"
             set mqPlaylist to first user playlist whose persistent ID is "\(pid)"
             play mqPlaylist
+            set song repeat to all
         end tell
         """
-        try ScriptRunner.shared.run(src)
+        try ScriptRunner.transport.run(src)
+        invalidateSettings()
+    }
+
+    static func currentPlaylistID() throws -> String {
+        try ScriptRunner.state.string("""
+        tell application id "com.apple.Music"
+            try
+                set mqID to persistent ID of current playlist
+                if mqID is missing value then return ""
+                return mqID as text
+            on error
+                return ""
+            end try
+        end tell
+        """)
     }
 
 
     static func revealPlaylist(_ persistentID: String) throws {
         let pid = esc(persistentID)
-        try ScriptRunner.shared.run("""
+        try ScriptRunner.transport.run("""
         tell application id "com.apple.Music"
             reveal (first user playlist whose persistent ID is "\(pid)")
         end tell

@@ -177,6 +177,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             .sink { [weak self] snapshot in self?.updateStatusTitle(snapshot) }
             .store(in: &cancellables)
 
+        // And show it as a Discord activity while it plays.
+        player.$now
+            .sink { DiscordPresence.shared.update($0) }
+            .store(in: &cancellables)
+
         menuPanel = MenuPanel(contentRect: .zero,
                               styleMask: [.borderless, .nonactivatingPanel],
                               backing: .buffered, defer: false)
@@ -201,6 +206,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             name: NSApplication.didChangeScreenParametersNotification, object: nil)
 
         if CommandLine.arguments.contains("--window") { showPlayerWindow() }
+        if CommandLine.arguments.contains("--resume-queue") {
+            Task { await player.resumeCurrentQueue() }
+        }
     }
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
@@ -209,6 +217,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        DiscordPresence.shared.shutdown()
         mediaKeys.stop()
         clearMarquee()
         dismissPanel()

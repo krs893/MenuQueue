@@ -175,7 +175,7 @@ struct TransportBar: View {
                   ? "キューをシャッフル（並びはキュータブに反映されます）"
                   : "Music.app のシャッフル")
 
-            Button { player.previous() } label: { Image(systemName: "backward.fill").frame(width: 28, height: 32) }.help("前の曲 / 曲の先頭")
+            Button { player.previous() } label: { Image(systemName: "backward.fill").frame(width: 28, height: 32) }.help("前の曲").accessibilityLabel("前の曲")
             Button { player.togglePlayPause() } label: {
                 Image(systemName: player.now.state.isPlaying ? "pause.circle.fill" : "play.circle.fill")
                     .font(.system(size: 36))
@@ -325,8 +325,7 @@ struct LibraryTab: View {
                                     && player.now.state.isPlaying,
                                  play: {
                                      let tracks = library.playlistTracks
-                                     guard let source = library.selectedPlaylist else { return }
-                                     Task { await player.playNatively(playlistID: source.id, tracks: tracks, startAt: index) }
+                                     Task { await player.playFromPlaylist(tracks, startAt: index) }
                                  },
                                  artwork: artwork)
                 }
@@ -407,6 +406,31 @@ struct ArtworkThumbnail: View {
 /// Whether the media keys are being handled, and a way to grant the
 /// permission they need. Rechecked every couple of seconds, since the grant
 /// happens in System Settings rather than here.
+/// Whether the playing song is shown as a Discord activity.
+struct DiscordStatusRow: View {
+    @State private var enabled = DiscordPresence.isEnabled
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "bubble.left.and.text.bubble.right")
+                .frame(width: 28)
+                .foregroundStyle(enabled ? AnyShapeStyle(.primary) : AnyShapeStyle(.secondary))
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Discord に表示").font(.system(size: 12))
+                Text("再生中の曲をアクティビティに出します（一時停止で消えます）")
+                    .font(.system(size: 10)).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Spacer(minLength: 0)
+            Toggle("", isOn: $enabled).labelsHidden().toggleStyle(.switch).controlSize(.small)
+        }
+        .onChange(of: enabled) { _, on in
+            DiscordPresence.isEnabled = on
+            DiscordPresence.shared.update(NowPlaying())   // clears at once when switched off
+        }
+    }
+}
+
 struct MediaKeyStatusRow: View {
     @State private var trusted = MediaKeyTap.isTrusted
     private let tick = Timer.publish(every: 2, on: .main, in: .common).autoconnect()
@@ -502,6 +526,8 @@ struct SettingsPanel: View {
                 }
                 Divider()
                 MediaKeyStatusRow()
+                Divider()
+                DiscordStatusRow()
                 Divider()
                 HStack {
                     Button(action: close) { Image(systemName: "chevron.left") }.help("戻る")
